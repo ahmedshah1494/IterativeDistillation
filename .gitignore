@@ -1,5 +1,7 @@
 logs/*
 models/*
+_logs/*
+_models/*
 adv_examples/*
 .vscode/*
 __pycache__/*
@@ -7,4 +9,5 @@ __pycache__/*
 *.pt
 *.json
 *.pkl
+*.log
 test

@@ -13,6 +13,7 @@ from tqdm import tqdm,trange
 from multiprocessing import cpu_count
 from copy import deepcopy
 from training import loss
+import os
 
 def distillation_loss(student_out, teacher_out, labels, loss_weight=1e-4, C=1, T=1):
     # xent = F.cross_entropy(student_out, labels)    
@@ -98,11 +99,11 @@ def distill(student_model, teacher_model, train_dataset, val_dataset, base_metri
             logger.info('epoch#%d train_loss=%.3f val_acc=%.3f lr=%.4f' % (i, epoch_loss, val_acc, optimizer.param_groups[0]['lr']))
             break
     return scheduler.best
-def iterative_distillation(teacher_model: models.ModelWrapper, train_dataset, val_dataset, nclasses, args):
+def iterative_distillation(teacher_model: models.ModelWrapper, bottleneck_layer_idx, train_dataset, val_dataset, nclasses, args):
     student_model = copy_model(teacher_model, args.device, reinitialize=True)
-    student_model.shrink_bottleneck(int(args.shrink_factor * student_model.bottleneck.weight.shape[0]))
+    student_model.shrink_layer(bottleneck_layer_idx, factor=0.9)    
     student_model = student_model.to(args.device)     
-    bottleneck_size = student_model.bottleneck.weight.shape[0]
+    bottleneck_size = student_model.layers[bottleneck_layer_idx].weight.shape[0]
 
     delta = 0
     base_metric = evaluate(teacher_model, val_dataset, args)
@@ -124,9 +125,9 @@ def iterative_distillation(teacher_model: models.ModelWrapper, train_dataset, va
             logger.info('saving model...')
             torch.save(student_model, args.outfile)
         
-        student_model.shrink_bottleneck(max(1,int(args.shrink_factor * bottleneck_size)))        
-        student_model = student_model.to(args.device)
-        bottleneck_size = student_model.bottleneck.weight.shape[0]
+        student_model.shrink_layer(bottleneck_layer_idx, factor=0.9)    
+        student_model = student_model.to(args.device)     
+        bottleneck_size = student_model.layers[bottleneck_layer_idx].weight.shape[0]
         if final:
             break
         if bottleneck_size == 1 and not final:
@@ -146,7 +147,9 @@ def main(args):
     
     teacher_model = torch.load(args.teacher_model_file).to(args.device) 
     teacher_model = teacher_model.eval()
-    iterative_distillation(teacher_model, train_dataset, val_dataset, nclasses, args)
+
+    shrinkable_layers = teacher_model.get_shrinkable_layers()
+    iterative_distillation(teacher_model, shrinkable_layers[-1], train_dataset, val_dataset, nclasses, args)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -170,6 +173,11 @@ if __name__ == '__main__':
     np.random.seed(1494)
     torch.manual_seed(1494)
     
+    if not os.path.exists(os.path.dirname(args.logfile)):
+        os.makedirs(os.path.dirname(args.logfile))
+    if not os.path.exists(os.path.dirname(args.outfile)):
+        os.makedirs(os.path.dirname(args.outfile))
+
     logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(threadName)-12.12s] [%(levelname)-5.5s]  %(message)s",

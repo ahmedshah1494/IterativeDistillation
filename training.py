@@ -9,9 +9,10 @@ import models
 import utils
 import numpy as np
 from tqdm import tqdm
+import os
 
 model_dict = {
-    'AlexNetCIFAR10' : models.AlexNetCIFAR10,
+    'AlexNetCIFAR' : models.AlexNetCIFAR,
     'AlexNet' : models.AlexNet,
     'PapernotCIFAR10' : models.PapernotCIFAR10,
     'PapernotCIFAR10_2' : models.PapernotCIFAR10_2,
@@ -84,14 +85,30 @@ def train(model, train_dataset, val_dataset, args):
 
         logger.info('epoch#%d train_loss=%.3f train_acc=%.3f val_acc=%.3f lr=%.4f' % (i, epoch_loss, epoch_acc, val_acc, optimizer.param_groups[0]['lr']))
 def main(args):
-    transform = utils.curry(lambda x: torch.from_numpy(np.array(x)).float(),torchvision.transforms.RandomAffine(30))
+    transform = torchvision.transforms.Compose([        
+        torchvision.transforms.RandomAffine(30), 
+        # torchvision.transforms.ColorJitter(brightness=0, contrast=0, saturation=0, hue=0),
+        torchvision.transforms.RandomGrayscale(p=0.1),                
+        ])
+    transform = utils.curry(lambda x: torch.from_numpy(np.array(x)).float(), transform)
+    transform = utils.curry(lambda x: x/255, transform)
+    norm_mean = torch.tensor([0.485, 0.456, 0.406]).view(1,1,-1)
+    norm_std = torch.tensor([0.229, 0.224, 0.225]).view(1,1,-1)
+    transform = utils.curry(lambda x: (x - norm_mean) / norm_std, transform)
     if args.dataset == 'CIFAR10':
         transform = utils.curry(lambda x: x.transpose(2,1).transpose(0,1), transform)
         train_dataset = torchvision.datasets.CIFAR10('/home/mshah1/workhorse3/', 
                     transform=transform, download=True)
         val_dataset = torchvision.datasets.CIFAR10('/home/mshah1/workhorse3/', train=False,
                     transform=transform, download=True)        
-        nclasses = 10        
+        nclasses = 10
+    if args.dataset == 'CIFAR100':
+        transform = utils.curry(lambda x: x.transpose(2,1).transpose(0,1), transform)
+        train_dataset = torchvision.datasets.CIFAR10('/home/mshah1/workhorse3/', 
+                    transform=transform, download=True)
+        val_dataset = torchvision.datasets.CIFAR10('/home/mshah1/workhorse3/', train=False,
+                    transform=transform, download=True)        
+        nclasses = 100
     elif args.dataset == 'ImageNet':
         train_dataset = torchvision.datasets.ImageNet('/home/mshah1/workhorse3/', train=True,
                                                 transform=transform, download=True)
@@ -118,12 +135,16 @@ if __name__ == '__main__':
     parser.add_argument('--nepochs', type=int, default=50)
     parser.add_argument('--batch_size', type=int, default=256)
     parser.add_argument('--lr', type=float, default=0.001)
-    parser.add_argument('--alpha', type=float, default=1)
-    parser.add_argument('--C', type=float, default=1)
+    parser.add_argument('--C', type=float, default=0)
     parser.add_argument('--outfile', type=str, default='model.pt')
     parser.add_argument('--logfile', type=str, default='training.log')
     parser.add_argument('--cuda', action='store_true')
     args = parser.parse_args()
+
+    if not os.path.exists(os.path.dirname(args.logfile)):
+        os.makedirs(os.path.dirname(args.logfile))
+    if not os.path.exists(os.path.dirname(args.outfile)):
+        os.makedirs(os.path.dirname(args.outfile))
 
     logging.basicConfig(
     level=logging.INFO,
