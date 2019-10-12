@@ -12,7 +12,7 @@ import numpy as np
 from tqdm import tqdm,trange
 from multiprocessing import cpu_count
 from copy import deepcopy
-from training import loss
+from training import loss, get_transform
 import os
 
 def distillation_loss(student_out, teacher_out, labels, loss_weight=1e-4, C=1, T=1):
@@ -134,7 +134,7 @@ def iterative_distillation(teacher_model: models.ModelWrapper, bottleneck_layer_
             final = True        
 
 def main(args):
-    transform = utils.curry(lambda x: torch.from_numpy(np.array(x)).float(),torchvision.transforms.RandomAffine(30))
+    transform = get_transform()
     if args.dataset == 'CIFAR10':
         transform = utils.curry(lambda x: x.transpose(2,1).transpose(0,1), transform)
         train_dataset = torchvision.datasets.CIFAR10('/home/mshah1/workhorse3/', 

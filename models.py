@@ -1,8 +1,6 @@
 import torch
 from torch import nn
-
-shrinkable_types = [nn.Linear, nn.Conv2d]
-is_shrinkable = lambda l: 1 in [int(isinstance(l,t)) for t in shrinkable_types]
+import utils
 
 class ModelWrapper(object):
     def __init__(self):
@@ -10,65 +8,17 @@ class ModelWrapper(object):
 
         self.layers = []
     def get_shrinkable_layers(self):
-        shrinkable_layers = [i for i,l in enumerate(self.layers[:-1]) if is_shrinkable(l)]
+        shrinkable_layers = [i for i,l in enumerate(self.layers[:-1]) if utils.is_shrinkable(l)]
         return shrinkable_layers
 
     def shrink_layer(self, i, factor=1, difference=0):
         if i == len(self.layers)-1 or i == -1:
             raise IndexError('Can not shrink output layer')        
-        self.layers[i], new_size = self.change_layer_output(self.layers[i], factor, difference)
+        self.layers[i], new_size = utils.change_layer_output(self.layers[i], factor, difference)
         i += 1
-        while not is_shrinkable(self.layers[i]):
+        while not utils.is_shrinkable(self.layers[i]):
             i += 1
-        self.layers[i] = self.change_layer_input(self.layers[i], new_size)
-    
-    @staticmethod
-    def change_layer_output(layer, factor=1, difference=0):
-        if isinstance(layer, nn.Linear):
-            outsize, insize = layer.weight.shape
-            new_size = int((outsize * factor) - difference)
-            new_layer = nn.Linear(insize, new_size)
-        elif isinstance(layer, nn.Conv2d):
-            new_size = int((layer.out_channels * factor) - difference)
-            new_layer = nn.Conv2d(
-                layer.in_channels,
-                new_size,
-                layer.kernel_size,
-                layer.stride,
-                layer.padding,
-                layer.dilation,
-                layer.transposed,
-                layer.output_padding,
-                layer.groups,
-                layer.padding_mode,
-            )
-        else:
-            raise NotImplementedError('%s not supported for size changing' % str(type(layer)))
-
-        return new_layer, new_size
-    
-    @staticmethod
-    def change_layer_input(layer, new_size):
-        if isinstance(layer, nn.Linear):
-            outsize, insize = layer.weight.shape            
-            new_layer = nn.Linear(new_size, outsize)
-        elif isinstance(layer, nn.Conv2d):            
-            new_layer = nn.Conv2d(
-                new_size,
-                layer.out_channels,
-                layer.kernel_size,
-                layer.stride,
-                layer.padding,
-                layer.dilation,
-                layer.transposed,
-                layer.output_padding,
-                layer.groups,
-                layer.padding_mode,
-            )
-        else:
-            raise NotImplementedError('%s not supported for size changing' % str(type(layer)))
-
-        return new_layer
+        self.layers[i] = utils.change_layer_input(self.layers[i], new_size)
 
 class Flatten(nn.Module):
     def __init__(self):

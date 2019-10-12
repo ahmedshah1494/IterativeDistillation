@@ -84,10 +84,10 @@ def train(model, train_dataset, val_dataset, args):
         scheduler.step(val_acc)
 
         logger.info('epoch#%d train_loss=%.3f train_acc=%.3f val_acc=%.3f lr=%.4f' % (i, epoch_loss, epoch_acc, val_acc, optimizer.param_groups[0]['lr']))
-def main(args):
+
+def get_transform():
     transform = torchvision.transforms.Compose([        
         torchvision.transforms.RandomAffine(30), 
-        # torchvision.transforms.ColorJitter(brightness=0, contrast=0, saturation=0, hue=0),
         torchvision.transforms.RandomGrayscale(p=0.1),                
         ])
     transform = utils.curry(lambda x: torch.from_numpy(np.array(x)).float(), transform)
@@ -95,6 +95,10 @@ def main(args):
     norm_mean = torch.tensor([0.485, 0.456, 0.406]).view(1,1,-1)
     norm_std = torch.tensor([0.229, 0.224, 0.225]).view(1,1,-1)
     transform = utils.curry(lambda x: (x - norm_mean) / norm_std, transform)
+    return transform
+
+def main(args):
+    transform = get_transform()
     if args.dataset == 'CIFAR10':
         transform = utils.curry(lambda x: x.transpose(2,1).transpose(0,1), transform)
         train_dataset = torchvision.datasets.CIFAR10('/home/mshah1/workhorse3/', 
