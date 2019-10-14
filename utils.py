@@ -3,6 +3,7 @@ from torch.utils.data import DataLoader
 import torch
 from torch import nn
 import torchvision
+from torchvision import transforms
 
 class AlphaCrossEntropyLoss(nn.Module):
     """docstring for alpha_softmax"""
@@ -24,7 +25,15 @@ class AlphaCrossEntropyLoss(nn.Module):
 def curry(new_func, func_seq):
     return lambda x: new_func(func_seq(x))
 
-compute_correct = lambda out,true: torch.sum((torch.argmax(out, 1) - true) == 0)
+compute_correct = lambda out,true: float(torch.sum((torch.argmax(out, 1) - true) == 0))
+
+def compute_correct_per_class(out, true, nclasses):
+    preds = torch.argmax(out,1)
+    correct = np.zeros(nclasses)
+    labels = set(list(true))
+    for l in labels:        
+        correct[l] = torch.sum(preds[true == l] == l)
+    return correct
 
 def evaluate(model, dataset, device):    
     loader = DataLoader(dataset, 1024, shuffle=False)
@@ -62,16 +71,64 @@ def attack(attack_class, classifier, inputs, true_targets, epsilon):
     x_test_adv = adv_crafter.generate(x=inputs)    
     return x_test_adv
 
+def reshape_multi_crop_tensor(x):
+    return x.view(-1, *(x.shape[2:]))
+
+def loss_wrapper(margin):
+    if margin == 0:
+        return nn.functional.cross_entropy
+    else:
+        return lambda x,y: nn.functional.multi_margin_loss(x/torch.sum(x,1,keepdim=True), y, margin=margin)
+
+def get_common_transform(training=True):
+    if training:
+        transform_list = [        
+            torchvision.transforms.RandomAffine(30), 
+            torchvision.transforms.RandomGrayscale(p=0.1),
+            ]
+    else:
+        transform_list = []
+    transform_list += [torchvision.transforms.ToTensor(),
+                        torchvision.transforms.Normalize(
+                            mean=[0.485, 0.456, 0.406],
+                            std=[0.229, 0.224, 0.225]
+                        )]
+    transform = torchvision.transforms.Compose(transform_list)
+    return transform
+
+normalize_transform = torchvision.transforms.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225]
+            )
+rescale_and_crop_transform = lambda f: transforms.Compose([
+    transforms.Resize(int(384*f)),
+    transforms.RandomCrop(224, pad_if_needed=True)
+])
+multi_scale_transform = transforms.Compose([
+    transforms.Lambda(lambda img: [rescale_and_crop_transform(f)(img) for f in [0.67,1,1.33]]),
+    transforms.Lambda(lambda crops: crops + [transforms.functional.hflip(c) for c in crops]),
+    transforms.Lambda(lambda crops: torch.stack([normalize_transform(transforms.ToTensor()(crop)) for crop in crops])),
+])        
+
+def channel_first_transform(x):
+    if isinstance(x, np.ndarray):
+        x = torch.from_numpy(x)
+    else:
+        x = torch.from_numpy(np.array(x)).float()
+    return x.transpose(2,1).transpose(0,1)
+
 shrinkable_types = [nn.Linear, nn.Conv2d]
 is_shrinkable = lambda l: 1 in [int(isinstance(l,t)) for t in shrinkable_types]
 
-def change_layer_output(layer, factor=1, difference=0):
+def change_layer_output(layer, new_size=None, factor=1, difference=0):
     if isinstance(layer, nn.Linear):
         outsize, insize = layer.weight.shape
-        new_size = int((outsize * factor) - difference)
+        if new_size is None:
+            new_size = int((outsize * factor) - difference)
         new_layer = nn.Linear(insize, new_size)
     elif isinstance(layer, nn.Conv2d):
-        new_size = int((layer.out_channels * factor) - difference)
+        if new_size is None:
+            new_size = int((layer.out_channels * factor) - difference)
         new_layer = nn.Conv2d(
             layer.in_channels,
             new_size,
