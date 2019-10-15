@@ -11,7 +11,7 @@ class ModelWrapper(object):
 
         self.layers = []
     def get_shrinkable_layers(self):
-        shrinkable_layers = [i for i,l in enumerate(self.layers[:-1]) if utils.is_shrinkable(l)]
+        shrinkable_layers = [i for i,l in enumerate(self.layers[:-1]) if utils.is_output_shrinkable(l)]
         return shrinkable_layers
 
     def shrink_layer(self, i, factor=1, difference=0):
@@ -317,7 +317,8 @@ def resnet18(num_classes, pretrained=False, feature_extraction=False, classifier
     if pretrained and feature_extraction:
         for param in m.parameters():
             param.requires_grad = False
-    m.fc, _ = utils.change_layer_output(m.fc, num_classes)    
+    num_ftrs = m.classifier[-1].in_features
+    m.classifier[-1] = get_classifier(num_ftrs, num_classes, classifier_depth)    
     for param in m.fc.parameters():
         param.requires_grad = True      
     return m
@@ -342,7 +343,8 @@ def alexnet(num_classes, pretrained=False, feature_extraction=False, classifier_
     if pretrained and feature_extraction:
         for param in m.parameters():
             param.requires_grad = False
-    m.classifier[-1], _ = utils.change_layer_output(m.classifier[-1], num_classes)
+    num_ftrs = m.classifier[-1].in_features
+    m.classifier[-1] = get_classifier(num_ftrs, num_classes, classifier_depth)
     for param in m.classifier[-1].parameters():
         param.requires_grad = True
     return m
