@@ -4,6 +4,8 @@ import torch
 from torch import nn
 import torchvision
 from torchvision import transforms
+from PIL import Image
+import os
 
 class AlphaCrossEntropyLoss(nn.Module):
     """docstring for alpha_softmax"""
@@ -26,6 +28,14 @@ def curry(new_func, func_seq):
     return lambda x: new_func(func_seq(x))
 
 compute_correct = lambda out,true: float(torch.sum((torch.argmax(out, 1) - true) == 0))
+
+def label_counts(loader, nclasses):
+    label_counts = [0]*nclasses
+    for _,y in loader:
+        for i in y:
+            label_counts[i] += 1
+    label_counts = np.array(label_counts)
+    return label_counts
 
 def compute_correct_per_class(out, true, nclasses):
     preds = torch.argmax(out,1)
@@ -83,6 +93,8 @@ def loss_wrapper(margin):
 def get_common_transform(training=True):
     if training:
         transform_list = [        
+            transforms.ColorJitter(),
+            transforms.RandomHorizontalFlip(),
             torchvision.transforms.RandomAffine(30), 
             torchvision.transforms.RandomGrayscale(p=0.1),
             ]
@@ -117,15 +129,17 @@ def channel_first_transform(x):
         x = torch.from_numpy(np.array(x)).float()
     return x.transpose(2,1).transpose(0,1)
 
-shrinkable_types = [nn.Linear, nn.Conv2d]
-is_shrinkable = lambda l: 1 in [int(isinstance(l,t)) for t in shrinkable_types]
+shrinkable_output = [nn.Linear, nn.Conv2d]
+shrinkable_input = [nn.Linear, nn.Conv2d, nn.BatchNorm2d]
+is_output_shrinkable = lambda l: 1 in [int(isinstance(l,t)) for t in shrinkable_output]
+is_input_shrinkable = lambda l: 1 in [int(isinstance(l,t)) for t in shrinkable_input]
 
 def change_layer_output(layer, new_size=None, factor=1, difference=0):
     if isinstance(layer, nn.Linear):
         outsize, insize = layer.weight.shape
         if new_size is None:
             new_size = int((outsize * factor) - difference)
-        new_layer = nn.Linear(insize, new_size)
+        new_layer = nn.Linear(insize, new_size)    
     elif isinstance(layer, nn.Conv2d):
         if new_size is None:
             new_size = int((layer.out_channels * factor) - difference)
@@ -150,6 +164,9 @@ def change_layer_input(layer, new_size):
     if isinstance(layer, nn.Linear):
         outsize, insize = layer.weight.shape            
         new_layer = nn.Linear(new_size, outsize)
+    if isinstance(layer, nn.BatchNorm2d):
+        size = layer.num_features
+        new_layer = nn.BatchNorm2d(new_size)
     elif isinstance(layer, nn.Conv2d):            
         new_layer = nn.Conv2d(
             new_size,
@@ -167,3 +184,91 @@ def change_layer_input(layer, new_size):
         raise NotImplementedError('%s not supported for size changing' % str(type(layer)))
 
     return new_layer
+
+def get_datasets(args):
+    common_transform = get_common_transform()
+    test_transform = get_common_transform(training=False)
+    if args.dataset == 'cifar10':        
+        train_dataset = torchvision.datasets.CIFAR10('/home/mshah1/workhorse3/', 
+                    transform=common_transform, download=True)
+        test_dataset = torchvision.datasets.CIFAR10('/home/mshah1/workhorse3/', train=False,
+                    transform=test_transform, download=True)        
+        nclasses = 10
+    elif args.dataset == 'cifar100':
+        train_dataset = torchvision.datasets.CIFAR100('/home/mshah1/workhorse3/', 
+                    transform=common_transform, download=True)
+        test_dataset = torchvision.datasets.CIFAR100('/home/mshah1/workhorse3/', train=False,
+                    transform=test_transform, download=True)        
+        nclasses = 100
+    elif 'caltech' in args.dataset:
+        if args.expand_w_multiple_scales:
+            train_transform = transforms.Compose([
+            transforms.Resize(384, Image.LANCZOS),
+            transforms.ColorJitter(),
+            multi_scale_transform
+            ])
+
+            test_transform = transforms.Compose([
+                transforms.Resize(384, Image.LANCZOS),            
+                multi_scale_transform
+            ])
+        else:
+            train_transform = transforms.Compose([
+                transforms.RandomResizedCrop(size=256, scale=(0.8, 1.0)),
+                transforms.RandomRotation(degrees=15),
+                transforms.ColorJitter(),
+                transforms.RandomHorizontalFlip(),
+                transforms.CenterCrop(size=224),  # Image net standards
+                transforms.ToTensor(),
+                transforms.Normalize([0.485, 0.456, 0.406],
+                                    [0.229, 0.224, 0.225])  # Imagenet standards
+            ])
+
+            test_transform = transforms.Compose([
+                transforms.Resize(size=256),
+                transforms.CenterCrop(size=224),
+                transforms.ToTensor(),
+                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+            ])
+
+        if args.dataset == 'caltech101':
+            ntrain_files = 30
+            nclasses = 102
+        if args.dataset == 'caltech256':
+            ntrain_files = 60
+            nclasses = 257
+
+        def is_valid_file(fn):
+            return os.path.basename(fn).split('.')[-1] == 'jpg'
+        def is_train_file(fn):
+            return is_valid_file(fn) and int(os.path.basename(fn).split('.')[0].split('_')[-1]) <= ntrain_files
+        def is_test_file(fn):
+            return is_valid_file(fn) and int(os.path.basename(fn).split('.')[0].split('_')[-1]) > ntrain_files
+
+        train_dataset = torchvision.datasets.ImageFolder('/home/mshah1/workhorse3/%s/' % args.dataset, 
+                                                            transform=train_transform,
+                                                            is_valid_file= is_train_file)        
+        test_dataset = torchvision.datasets.ImageFolder('/home/mshah1/workhorse3/%s/' % args.dataset, 
+                                                            transform=test_transform,
+                                                            is_valid_file= is_test_file)
+        print(train_dataset[0][0].shape)
+        
+    elif args.dataset == 'tiny_imagenet':
+        train_transform = transforms.Compose([
+            # transforms.Resize(224, Image.BICUBIC),
+            transforms.RandomHorizontalFlip(),
+            common_transform
+        ])
+        test_transform = transforms.Compose([
+            # transforms.Resize(224, Image.BICUBIC),
+            test_transform
+        ])
+        train_dataset = torchvision.datasets.ImageFolder('/home/mshah1/workhorse3/tiny-imagenet-200/train/', 
+                                                            transform=train_transform)
+        test_dataset = torchvision.datasets.ImageFolder('/home/mshah1/workhorse3/tiny-imagenet-200/val/', 
+                                                            transform=test_transform)
+        print(train_dataset[0][0].shape)
+        nclasses = 200
+    else:
+        raise NotImplementedError
+    return train_dataset, test_dataset, nclasses
