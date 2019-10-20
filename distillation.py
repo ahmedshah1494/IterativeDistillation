@@ -1,7 +1,7 @@
 import torch
 from torch import nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, random_split, Dataset
 import torchvision
 import argparse
 import logging
@@ -33,12 +33,18 @@ def cross_entropy(logits_p, logits_q, T):
     q = F.log_softmax(logits_q/T, dim=1)
     return torch.mean(torch.sum(-p*q, dim=1))
 
-def distillation_loss(student_out, teacher_out, labels, loss_weight=1e-4, C=1, T=1):
+def distillation_loss(student_out, teacher_out, labels, loss_weight=1e-4, C=1, T=1, soft_loss_type='xent'):
     # xent = F.cross_entropy(student_out, labels)    
     hard_loss = utils.loss_wrapper(C)(student_out, labels)
     # soft_loss = F.kl_div(F.log_softmax(student_out/T, dim=1), F.softmax(teacher_out/T, dim=1), reduction='batchmean')
-    soft_loss = cross_entropy(teacher_out, student_out, T)
-    return soft_loss*(1-loss_weight)*T**2 + loss_weight*hard_loss, soft_loss, hard_loss
+    if soft_loss_type == 'xent':
+        soft_loss = cross_entropy(teacher_out, student_out, T)    
+        return soft_loss*(1-loss_weight)*T**2 + loss_weight*hard_loss, soft_loss, hard_loss
+    elif soft_loss_type == 'rmse':
+        soft_loss = torch.sqrt(torch.mean((teacher_out - student_out)**2))
+        return soft_loss*(1-loss_weight) + loss_weight*hard_loss, soft_loss, hard_loss
+    else:
+        raise NotImplementedError('soft_loss_type %s not supported' % soft_loss_type)
 
 def copy_model(model, device, reinitialize=False):
     new_model = deepcopy(model)
@@ -51,7 +57,7 @@ def copy_model(model, device, reinitialize=False):
     return new_model
 
 def evaluate(model, val_dataset, args):
-    val_loader = DataLoader(val_dataset, 1024, shuffle=False)
+    val_loader = DataLoader(val_dataset, args.batch_size, shuffle=False)
     val_correct = 0
     for batch in val_loader:
         model.eval()
@@ -63,10 +69,33 @@ def evaluate(model, val_dataset, args):
     val_acc = val_correct / len(val_dataset) 
     return val_acc
 
-def distill(student_model, teacher_model, train_dataset, val_dataset, base_metric, args):
-    train_loader = DataLoader(train_dataset, args.batch_size, num_workers=cpu_count()//2, shuffle=True)
-    val_loader = DataLoader(val_dataset, args.batch_size, num_workers=cpu_count()//2, shuffle=False)
+def get_logits(model, dataset, args):
+    loader = DataLoader(dataset, args.batch_size, num_workers=cpu_count()//2, shuffle=False)
 
+    X = []
+    Y = []
+    Z = []
+    for batch in loader:
+        x,y = batch
+        x,y = x.to(args.device), y.to(args.device)
+        z = model(x)
+        
+        z = z.detach().cpu()
+        x = x.detach().cpu()
+        y = y.detach().cpu()
+
+        X.append(x)
+        Y.append(y)
+        Z.append(z)
+    
+    X = torch.cat(X, 0)
+    Y = torch.cat(Y, 0)
+    Z = torch.cat(Z, 0)
+    print(X.shape, Y.shape, Z.shape)
+    logits = torch.utils.data.TensorDataset(X,Y,Z)
+    return logits
+
+def distill(student_model, train_loader, val_loader, base_metric, args):    
     criterion = distillation_loss
     if args.optimizer == 'adam':
         optimizer = torch.optim.Adam(student_model.parameters(), lr=args.lr, weight_decay=1e-4)
@@ -85,16 +114,19 @@ def distill(student_model, teacher_model, train_dataset, val_dataset, base_metri
         epoch_hard_loss = 0
         epoch_correct = 0
         count = 0
-        # t = tqdm(enumerate(train_loader))
-        # t.set_description('epoch#%d' % i)
-        for j,batch in enumerate(train_loader):
+        for j,(x,y,z) in enumerate(train_loader):
             student_model = student_model.train()
             optimizer.zero_grad()
-            x,y = batch
-            x,y = x.to(args.device), y.to(args.device)
-            z = teacher_model(x)
+            x = x.to(args.device)
             z_ = student_model(x)
-            train_loss, train_soft_loss, train_hard_loss = criterion(z_, z, y, loss_weight=args.loss_weight, C=args.C, T=args.T)
+            del x
+
+            y, z = y.to(args.device), z.to(args.device)
+            
+            train_loss, train_soft_loss, train_hard_loss = criterion(z_, z, y, 
+                                                                    loss_weight=args.loss_weight, 
+                                                                    C=args.C, T=args.T, 
+                                                                    soft_loss_type=args.soft_loss_type)
             train_loss.backward()
             nn.utils.clip_grad_norm_(student_model.parameters(), 5.0)
             optimizer.step()
@@ -103,25 +135,20 @@ def distill(student_model, teacher_model, train_dataset, val_dataset, base_metri
             epoch_hard_loss += float(train_hard_loss)
             epoch_correct += float(utils.compute_correct(z_, y))
             count += 1
-            # t.set_postfix(loss=epoch_loss/((j+1)*args.batch_size), lr=optimizer.param_groups[0]['lr'], accuracy=epoch_correct/((j+1)*args.batch_size)) 
         epoch_loss /= count
         epoch_soft_loss /= count
         epoch_hard_loss /= count
 
         val_correct = 0
-        val_loss = 0
-        count = 0
+        count = 0        
         for batch in val_loader:
             student_model = student_model.eval()
             x,y = batch
-            x,y = x.to(args.device), y.to(args.device)
-            z = teacher_model(x)
-            z_ = student_model(x)
-            val_loss += float(criterion(z_, z, y, loss_weight=args.loss_weight, C=args.C, T=args.T)[0])
+            x = x.to(args.device)
+            z_ = student_model(x).detach().cpu()
             val_correct += float(utils.compute_correct(z_,y))
-            count += 1
-        val_loss /= count          
-        val_acc = val_correct / len(val_dataset)
+            count += x.shape[0]         
+        val_acc = val_correct / count
 
         old_lr = optimizer.param_groups[0]['lr']
         scheduler.step(val_acc)
@@ -129,56 +156,81 @@ def distill(student_model, teacher_model, train_dataset, val_dataset, base_metri
         # if optimizer.param_groups[0]['lr'] != old_lr:
         #     args.T = min(args.max_T, args.T*2)
         t.set_postfix(train_loss=epoch_loss, train_soft_loss=epoch_soft_loss, train_hard_loss=epoch_hard_loss, 
-                        val_loss=val_loss, val_acc=val_acc, lr=optimizer.param_groups[0]['lr'], T=args.T)        
+                        val_acc=val_acc, lr=optimizer.param_groups[0]['lr'], T=args.T)        
         if i % 10 == 0:
             logger.info('epoch#%d train_loss=%.3f train_hard_loss=%.3f train_soft_loss=%.3f val_acc=%.3f lr=%.4f' % (i, epoch_loss, epoch_hard_loss, epoch_soft_loss, val_acc, optimizer.param_groups[0]['lr']))
         if val_acc-base_metric >= args.tol:
             logger.info('epoch#%d train_loss=%.3f train_hard_loss=%.3f train_soft_loss=%.3f val_acc=%.3f lr=%.4f' % (i, epoch_loss, epoch_hard_loss, epoch_soft_loss, val_acc, optimizer.param_groups[0]['lr']))
             break
     return scheduler.best
-def iterative_distillation(teacher_model, student_model:StudentModelWrapper, bottleneck_layer_idx, train_dataset, val_dataset, test_dataset, nclasses, args):
+    
+def iterative_distillation(student_model:StudentModelWrapper, bottleneck_layer_idx, train_dataset, val_dataset, test_dataset, nclasses, base_metric, args): 
+    train_loader = DataLoader(train_dataset, args.batch_size, num_workers=cpu_count()//2, shuffle=True)
+    val_loader = DataLoader(val_dataset, args.batch_size, num_workers=cpu_count()//2, shuffle=False)
+
+    torch.save(student_model, args.outfile)
+
     print('shrinking layer %d...' % bottleneck_layer_idx)    
-    logger.info('shrinking layer %d...' % bottleneck_layer_idx)    
-    student_model.shrink_layer(bottleneck_layer_idx, factor=args.shrink_factor)    
-    student_model = student_model.to(args.device)     
-    bottleneck_size = student_model.layers[bottleneck_layer_idx].weight.shape[0]
-    delta = 0
-    base_metric = evaluate(teacher_model, val_dataset, args)
-    niters = 0
-    final = False
-    print('base_metric = %.4f' % (base_metric))
-    logger.info('base_metric = %.4f' % (base_metric))
-    while (bottleneck_size > 1 or final):  
+    logger.info('shrinking layer %d...' % bottleneck_layer_idx)
+
+    gpu_mem = torch.cuda.memory_allocated(args.device)
+    if not student_model.shrink_layer(bottleneck_layer_idx, factor=args.shrink_factor):
+        return student_model
+    torch.cuda.ipc_collect()
+    print('\nchange in mem after shrinking:%d\t%d\n' % (torch.cuda.memory_allocated(args.device) - gpu_mem, torch.cuda.memory_allocated()))
+
+    print(student_model)   
+    student_model = student_model.to(args.device)
+    bottleneck_size,_ = utils.get_layer_input_output_size(student_model.layers[bottleneck_layer_idx])
+    
+    delta = 0    
+    while (bottleneck_size > 0):  
         print('bottleneck_size = %d' % bottleneck_size)
-        logger.info('bottleneck_size = %d' % bottleneck_size)        
-        metric = distill(student_model, teacher_model, train_dataset, val_dataset, base_metric, args)
+        logger.info('bottleneck_size = %d' % bottleneck_size)   
+        gpu_mem = torch.cuda.memory_allocated(args.device)
+        metric = distill(student_model, train_loader, val_loader, base_metric, args)
+        torch.cuda.ipc_collect()
+        print('\nchange in mem after distillation:%d\t%d\n' % (torch.cuda.memory_allocated(args.device) - gpu_mem, torch.cuda.memory_allocated()))
         logger.info('current metric = %.4f base_metric = %.4f' % (metric, base_metric))
 
         delta = metric - base_metric
         if delta < args.tol:
-            logger.info('tolerance violated; stopping distillation')
+            logger.info('tolerance violated; stopping distillation')            
             break
         else:        
             logger.info('saving model...')
             torch.save(student_model, args.outfile)
-        
-        student_model.shrink_layer(bottleneck_layer_idx, factor=args.shrink_factor)    
-        student_model = student_model.to(args.device)     
-        bottleneck_size = student_model.layers[bottleneck_layer_idx].weight.shape[0]
-        if final:
+
+        gpu_mem = torch.cuda.memory_allocated(args.device)
+        if not student_model.shrink_layer(bottleneck_layer_idx, factor=args.shrink_factor):
             break
-        if bottleneck_size == 1 and not final:
-            final = True
-    evaluate(teacher_model, test_dataset, args)
-    print('test_metric = %.4f' % (base_metric))
-    logger.info('test_metric = %.4f' % (base_metric))
+        student_model = student_model.to(args.device)
+        torch.cuda.ipc_collect()
+        print('\nchange in mem after shrinking:%d\t%d\n' % (torch.cuda.memory_allocated(args.device) - gpu_mem, torch.cuda.memory_allocated()))
+
+        new_bottleneck_size,_ = utils.get_layer_input_output_size(student_model.layers[bottleneck_layer_idx])
+        if new_bottleneck_size == bottleneck_size:
+            break
+        else:
+            bottleneck_size = new_bottleneck_size
+    
+    student_model = student_model.to(args.device) 
+    
+    val_metric = evaluate(student_model, val_dataset, args)
+    print('val_metric:', val_metric)
+    delta = val_metric - base_metric
+    if delta >= args.tol:
+        logger.info('saving model...')
+        torch.save(student_model, args.outfile)
+
+    student_model = torch.load(args.outfile).to(args.device)
     return student_model
 
 def simple_distillation(teacher_model: models.ModelWrapper, student_model, train_dataset, val_dataset, nclasses, args):
     base_metric = evaluate(teacher_model, val_dataset, args)
     print('base_metric = %.4f' % (base_metric))
     logger.info('base_metric = %.4f' % (base_metric))
-    distill(student_model, teacher_model, train_dataset, val_dataset, base_metric, args)    
+    distill(student_model, teacher_model, train_dataset, val_dataset, base_metric, args) 
 
 def main(args):
     train_dataset, test_dataset, nclasses = utils.get_datasets(args)
@@ -188,7 +240,14 @@ def main(args):
     
     teacher_model = torch.load(args.teacher_model_file).to(args.device) 
     teacher_model = teacher_model.eval()
+    
+    base_metric = evaluate(teacher_model, val_dataset, args)
+    print('base_metric = %.4f' % (base_metric))
+    logger.info('base_metric = %.4f' % (base_metric))
 
+    train_logits = get_logits(teacher_model, train_dataset, args)
+    teacher_model = teacher_model.cpu()
+    
     if args.student_model_file is None:
         student_model = copy_model(teacher_model, args.device, reinitialize=(not args.retain_teacher_weights))
         student_model = StudentModelWrapper(student_model)
@@ -196,8 +255,28 @@ def main(args):
             param.requires_grad = True
     else:
         student_model = torch.load(args.student_model_file)
+    del teacher_model
+
+    
     shrinkable_layers = student_model.get_shrinkable_layers()
-    iterative_distillation(teacher_model, student_model, shrinkable_layers[-1], train_dataset, val_dataset, test_dataset, nclasses, args)
+    if args.shrink_all:  
+        not_shrinkables = []              
+        while len(shrinkable_layers) > 0:
+            student_model = iterative_distillation(student_model, shrinkable_layers[0], train_logits, val_dataset, test_dataset, nclasses, base_metric, args)
+            print(student_model)
+            new_shrinkable_layers = student_model.get_shrinkable_layers(not_shrinkables)
+            if shrinkable_layers == new_shrinkable_layers:
+                not_shrinkables.append(shrinkable_layers[0])            
+            shrinkable_layers = [x for x in new_shrinkable_layers if x not in not_shrinkables]
+            print(not_shrinkables, shrinkable_layers)
+    else:
+        student_model = iterative_distillation(student_model, shrinkable_layers[-1], train_logits, val_dataset, test_dataset, nclasses, base_metric, args)
+    
+
+    print(student_model)
+    test_metric = evaluate(student_model, test_dataset, args)
+    print('test_metric = %.4f' % (test_metric))
+    logger.info('test_metric = %.4f' % (test_metric))
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -208,6 +287,7 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', type=int, default=256)
     parser.add_argument('--patience', type=int, default=5)
     parser.add_argument('--optimizer', type=str, default='adam', help='adam/sgd')
+    parser.add_argument('--soft_loss_type', type=str, default='xent', help='xent/rmse')
     parser.add_argument('--lr', type=float, default=0.001)
     parser.add_argument('--C', type=float, default=1)
     parser.add_argument('--T', type=float, default=1)
@@ -219,11 +299,13 @@ if __name__ == '__main__':
     parser.add_argument('--logfile', type=str, default='logs/distillation/distillation.log')
     parser.add_argument('--cuda', action='store_true')
     parser.add_argument('--retain_teacher_weights', action='store_true')
+    parser.add_argument('--shrink_all', action='store_true')
     args = parser.parse_args()
 
     np.random.seed(1494)
     torch.manual_seed(1494)
-    
+    torch.cuda.manual_seed_all(1494)
+
     if not os.path.exists(os.path.dirname(args.logfile)):
         os.makedirs(os.path.dirname(args.logfile))
     if not os.path.exists(os.path.dirname(args.outfile)):
