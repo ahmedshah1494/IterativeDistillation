@@ -10,18 +10,55 @@ class ModelWrapper(object):
         super(ModelWrapper, self).__init__()
 
         self.layers = []
-    def get_shrinkable_layers(self):
-        shrinkable_layers = [i for i,l in enumerate(self.layers[:-1]) if utils.is_output_shrinkable(l)]
+        
+    def get_shrinkable_layers(self, non_shrinkables=[]):
+        shrinkable_layers = [i for i,l in enumerate(self.layers[:-1]) if utils.is_output_modifiable(l) and i not in non_shrinkables]
         return shrinkable_layers
+    
+    def is_last_conv(self,i):
+        if not isinstance(self.layers[i], nn.Conv2d):
+            return False
+            
+        for j in range(i+1, len(self.layers)):
+            if isinstance(self.layers[j], nn.Conv2d):
+                return False
+        return True
+
+    def replace_layer(self, i, new_layer):
+        layers = list(self.layers.children())
+        layers[i] = new_layer
+        self.__delattr__('layers')
+        self.layers = nn.Sequential(*layers)
 
     def shrink_layer(self, i, factor=1, difference=0):
         if i == len(self.layers)-1 or i == -1:
-            raise IndexError('Can not shrink output layer')        
-        self.layers[i], new_size = utils.change_layer_output(self.layers[i], factor, difference)
-        i += 1
-        while not utils.is_shrinkable(self.layers[i]):
-            i += 1
-        self.layers[i] = utils.change_layer_input(self.layers[i], new_size)
+            raise IndexError('Can not shrink output layer')
+        out_size, _ = utils.get_layer_input_output_size(self.layers[i])         
+        new_layer , new_size = utils.change_layer_output(self.layers[i], factor=factor, difference=difference)
+        if new_layer is None and self.is_last_conv(i):
+            return False
+        # self.layers[i] = new_layer
+        self.replace_layer(i, new_layer)
+        if self.layers[i] is None:
+            while not utils.is_weighted(self.layers[i]):
+                print('deleting',self.layers[i])
+                self.layers.__delitem__(i)
+            # self.layers[i] = utils.change_layer_input(self.layers[i], new_size)
+            new_layer = utils.change_layer_input(self.layers[i], new_size)
+            self.replace_layer(i, new_layer)
+            return False
+        else:
+            while i < len(self.layers)-1:
+                i += 1
+                if utils.is_input_modifiable(self.layers[i]):
+                    _,in_size = utils.get_layer_input_output_size(self.layers[i])
+                    scale = in_size // out_size
+                    # self.layers[i] = utils.change_layer_input(self.layers[i], new_size*scale)
+                    new_layer = utils.change_layer_input(self.layers[i], new_size*scale)
+                    self.replace_layer(i, new_layer)
+                    if not isinstance(self.layers[i], nn.BatchNorm2d):
+                        break
+            return True
 
 class Flatten(nn.Module):
     def __init__(self):
@@ -355,3 +392,18 @@ def alexnetCIFAR(num_classes, pretrained=False, feature_extraction=False, **kwar
 def papernot(num_classes, pretrained=False, feature_extraction=False, **kwargs):
     m = PapernotCIFAR10(num_classes)
     return m
+
+def setup_feature_extraction_model(model, model_type, num_classes, classifier_depth=1):
+    for p in model.parameters():
+        p.requires_grad = False
+    if model_type == 'vgg16' or model_type =='AlexNet':        
+        num_ftrs = model.classifier[-1][-1].in_features
+        model.classifier[-1][-1] = get_classifier(num_ftrs, num_classes, classifier_depth)
+        for param in model.classifier[-1][-1].parameters():
+            param.requires_grad = True
+    else:
+        old_classifier = model.layers[-1]
+        model.layers[-1] = get_classifier(old_classifier.in_features, num_classes, classifier_depth)
+        for p in model.layers[-1].parameters():
+            p.requires_grad = True
+    

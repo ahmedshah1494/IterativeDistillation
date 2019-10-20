@@ -129,20 +129,37 @@ def channel_first_transform(x):
         x = torch.from_numpy(np.array(x)).float()
     return x.transpose(2,1).transpose(0,1)
 
-shrinkable_output = [nn.Linear, nn.Conv2d]
-shrinkable_input = [nn.Linear, nn.Conv2d, nn.BatchNorm2d]
-is_output_shrinkable = lambda l: 1 in [int(isinstance(l,t)) for t in shrinkable_output]
-is_input_shrinkable = lambda l: 1 in [int(isinstance(l,t)) for t in shrinkable_input]
+def reinitialize_model(model):
+    for param in model.parameters():
+        if len(param.shape) >= 2:
+            torch.nn.init.xavier_uniform_(param.data)
+        else:
+            torch.nn.init.constant_(param.data,0)
 
-def change_layer_output(layer, new_size=None, factor=1, difference=0):
+modifiable_output = [nn.Linear, nn.Conv2d]
+weighted_layers = [nn.Linear, nn.Conv2d]
+modifiable_input = [nn.Linear, nn.Conv2d, nn.BatchNorm2d]
+is_output_modifiable = lambda l: 1 in [int(isinstance(l,t)) for t in modifiable_output]
+is_weighted = lambda l: 1 in [int(isinstance(l,t)) for t in weighted_layers]
+is_input_modifiable = lambda l: 1 in [int(isinstance(l,t)) for t in modifiable_input]
+
+def change_layer_output(layer, new_size=None, factor=1, difference=0):    
     if isinstance(layer, nn.Linear):
         outsize, insize = layer.weight.shape
         if new_size is None:
             new_size = int((outsize * factor) - difference)
+        if new_size == outsize:
+            return layer, new_size
+        if new_size < 1:
+            return None,insize
         new_layer = nn.Linear(insize, new_size)    
     elif isinstance(layer, nn.Conv2d):
         if new_size is None:
             new_size = int((layer.out_channels * factor) - difference)
+        if new_size == layer.out_channels:
+            return layer, new_size
+        if new_size < 1:
+            return None,layer.in_channels
         new_layer = nn.Conv2d(
             layer.in_channels,
             new_size,
@@ -150,40 +167,50 @@ def change_layer_output(layer, new_size=None, factor=1, difference=0):
             layer.stride,
             layer.padding,
             layer.dilation,
-            layer.transposed,
-            layer.output_padding,
-            layer.groups,
-            layer.padding_mode,
         )
     else:
-        raise NotImplementedError('%s not supported for size changing' % str(type(layer)))
+        raise NotImplementedError('%s not supported for output size modification' % str(type(layer)))
 
     return new_layer, new_size
 
 def change_layer_input(layer, new_size):
+    if new_size == 0:
+        return None
     if isinstance(layer, nn.Linear):
-        outsize, insize = layer.weight.shape            
+        outsize, insize = layer.weight.shape
+        if new_size == insize:
+            return layer        
         new_layer = nn.Linear(new_size, outsize)
-    if isinstance(layer, nn.BatchNorm2d):
+    elif isinstance(layer, nn.BatchNorm2d):
         size = layer.num_features
+        if new_size == size:
+            return layer
         new_layer = nn.BatchNorm2d(new_size)
-    elif isinstance(layer, nn.Conv2d):            
+    elif isinstance(layer, nn.Conv2d):
+        if new_size == layer.in_channels:
+            return layer
         new_layer = nn.Conv2d(
             new_size,
             layer.out_channels,
             layer.kernel_size,
             layer.stride,
             layer.padding,
-            layer.dilation,
-            layer.transposed,
-            layer.output_padding,
-            layer.groups,
-            layer.padding_mode,
+            layer.dilation
         )
     else:
-        raise NotImplementedError('%s not supported for size changing' % str(type(layer)))
+        raise NotImplementedError('%s not supported for input size modification' % str(type(layer)))
 
     return new_layer
+
+def get_layer_input_output_size(layer):
+    if isinstance(layer, nn.Linear):
+        return layer.weight.shape
+    elif isinstance(layer, nn.BatchNorm2d):
+        return layer.num_features, layer.num_features
+    elif isinstance(layer, nn.Conv2d):
+        return layer.out_channels, layer.in_channels
+    else:
+        raise NotImplementedError('%s not supported' % str(type(layer)))
 
 def get_datasets(args):
     common_transform = get_common_transform()
@@ -201,35 +228,23 @@ def get_datasets(args):
                     transform=test_transform, download=True)        
         nclasses = 100
     elif 'caltech' in args.dataset:
-        if args.expand_w_multiple_scales:
-            train_transform = transforms.Compose([
-            transforms.Resize(384, Image.LANCZOS),
+        train_transform = transforms.Compose([
+            transforms.RandomResizedCrop(size=256, scale=(0.8, 1.0)),
+            transforms.RandomRotation(degrees=15),
             transforms.ColorJitter(),
-            multi_scale_transform
-            ])
+            transforms.RandomHorizontalFlip(),
+            transforms.CenterCrop(size=224),  # Image net standards
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406],
+                                [0.229, 0.224, 0.225])  # Imagenet standards
+        ])
 
-            test_transform = transforms.Compose([
-                transforms.Resize(384, Image.LANCZOS),            
-                multi_scale_transform
-            ])
-        else:
-            train_transform = transforms.Compose([
-                transforms.RandomResizedCrop(size=256, scale=(0.8, 1.0)),
-                transforms.RandomRotation(degrees=15),
-                transforms.ColorJitter(),
-                transforms.RandomHorizontalFlip(),
-                transforms.CenterCrop(size=224),  # Image net standards
-                transforms.ToTensor(),
-                transforms.Normalize([0.485, 0.456, 0.406],
-                                    [0.229, 0.224, 0.225])  # Imagenet standards
-            ])
-
-            test_transform = transforms.Compose([
-                transforms.Resize(size=256),
-                transforms.CenterCrop(size=224),
-                transforms.ToTensor(),
-                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-            ])
+        test_transform = transforms.Compose([
+            transforms.Resize(size=256),
+            transforms.CenterCrop(size=224),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        ])
 
         if args.dataset == 'caltech101':
             ntrain_files = 30

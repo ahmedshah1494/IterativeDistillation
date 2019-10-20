@@ -14,6 +14,7 @@ import os
 from PIL import Image
 from distillation import simple_distillation
 from multiprocessing import cpu_count
+from distillation import StudentModelWrapper
 
 model_dict = {
     'resnet18TinyImageNet': models.resnet18TinyImageNet,
@@ -79,7 +80,7 @@ def train(model, train_dataset, test_dataset, nclasses, args, val_dataset=None):
     val_loader = DataLoader(val_dataset, args.batch_size, shuffle=False, num_workers=(cpu_count())//2) 
     if not args.test_only:
         criterion = utils.loss_wrapper(args.C)
-        optimizer = torch.optim.SGD(get_trainable_params(model), lr=args.lr, weight_decay=5e-4, momentum=0.9)    
+        optimizer = torch.optim.SGD(get_trainable_params(model), lr=args.lr, weight_decay=5e-3, momentum=0.9)    
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', patience=args.patience, factor=0.5)
 
         val_label_counts = utils.label_counts(val_loader, nclasses)
@@ -111,6 +112,9 @@ def train(model, train_dataset, test_dataset, nclasses, args, val_dataset=None):
 
             logger.info('epoch#%d train_loss=%.3f train_acc=%.3f val_acc=%.3f lr=%.4f' % (i, epoch_loss, epoch_acc, val_acc, optimizer.param_groups[0]['lr']))
     
+    if args.test_pc < 1:
+        new_test_size = int(args.test_pc * len(test_dataset))
+        test_dataset, _ = random_split(test_dataset, [new_test_size, len(test_dataset)-new_test_size])
     test_loader = DataLoader(test_dataset, args.batch_size, shuffle=False, num_workers=(cpu_count())//2)
 
     test_label_counts = utils.label_counts(test_loader, nclasses)
@@ -125,12 +129,17 @@ def main(args):
     train_dataset, test_dataset, nclasses = utils.get_datasets(args)
 
     if args.model_path is not None:
-        model = torch.load(args.model_path)
+        model = torch.load(args.model_path)        
         if not args.feature_extraction:
             for param in model.parameters():
                 param.requires_grad = True
+        else:
+            models.setup_feature_extraction_model(model, args.model, nclasses, args.classifier_depth)
     else:
         model = model_dict[args.model](nclasses, args.pretrained, args.feature_extraction, args.classifier_depth)
+
+    if args.reinitialize:
+        utils.reinitialize_model(model)
 
     if use_cuda:        
         model = model.cuda()
@@ -151,11 +160,17 @@ if __name__ == '__main__':
     parser.add_argument('--logfile', type=str, default='training.log')
     parser.add_argument('--cuda', action='store_true')
     parser.add_argument('--pretrained', action='store_true')
+    parser.add_argument('--reinitialize', action='store_true')
     parser.add_argument('--feature_extraction', action='store_true')
     parser.add_argument('--expand_w_multiple_scales', action='store_true')
     parser.add_argument('--test_only', action='store_true')
+    parser.add_argument('--test_pc', type=float, default=1.0)
     parser.add_argument('--classifier_depth', type=int, default=1)
     args = parser.parse_args()
+
+    np.random.seed(1494)
+    torch.manual_seed(1494)
+    torch.cuda.manual_seed_all(1494)
 
     if not os.path.exists(os.path.dirname(args.logfile)):
         os.makedirs(os.path.dirname(args.logfile))
