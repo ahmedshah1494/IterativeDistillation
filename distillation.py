@@ -56,18 +56,37 @@ def copy_model(model, device, reinitialize=False):
                 torch.nn.init.constant_(param.data,0)
     return new_model
 
-def evaluate(model, val_dataset, args):
-    val_loader = DataLoader(val_dataset, args.batch_size, shuffle=False)
-    val_correct = 0
-    for batch in val_loader:
-        model.eval()
-        x,y = batch        
-        x = x.to(args.device)
-        y = y.to(args.device)
-        out = model(x)
-        val_correct += float(utils.compute_correct(out,y))
-    val_acc = val_correct / len(val_dataset) 
-    return val_acc
+def evaluate_on_batch(model, batch, device, metric=utils.compute_correct):
+    model.eval()
+    x,y = batch
+    x = x.to(device)
+    y = y.to(device)        
+    out = model(x)
+    return metric(out,y)
+
+def evaluate(model, val_dataset, args, nclasses):
+    loader = DataLoader(val_dataset, args.batch_size, shuffle=False)
+    label_counts = utils.label_counts(loader, nclasses)
+    val_correct = 0    
+    if label_counts is not None:
+        val_correct = np.zeros(len(label_counts))
+        metric = lambda out, true: utils.compute_correct_per_class(out, true, len(label_counts))
+    else:
+        metric = utils.compute_correct
+        
+    for batch in loader:
+        val_correct += evaluate_on_batch(model, batch, args.device, metric)    
+    return np.nanmean(val_correct / label_counts)
+    # val_correct = 0
+    # for batch in val_loader:
+    #     model.eval()
+    #     x,y = batch        
+    #     x = x.to(args.device)
+    #     y = y.to(args.device)
+    #     out = model(x)
+    #     val_correct += float(utils.compute_correct(out,y))
+    # val_acc = val_correct / len(val_dataset) 
+    # return val_acc
 
 def get_logits(model, dataset, args):
     loader = DataLoader(dataset, args.batch_size, num_workers=cpu_count()//2, shuffle=False)
@@ -95,7 +114,7 @@ def get_logits(model, dataset, args):
     logits = torch.utils.data.TensorDataset(X,Y,Z)
     return logits
 
-def distill(student_model, train_loader, val_loader, base_metric, args):    
+def distill(student_model, train_loader, val_loader, base_metric, nclasses, args):    
     criterion = distillation_loss
     if args.optimizer == 'adam':
         optimizer = torch.optim.Adam(student_model.parameters(), lr=args.lr, weight_decay=1e-4)
@@ -105,7 +124,8 @@ def distill(student_model, train_loader, val_loader, base_metric, args):
         raise ValueError('optimizer should be either "adam" or "sgd"')
 
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', patience=args.patience, factor=0.5)
-
+    label_counts = utils.label_counts(val_loader, nclasses)
+    metric = lambda out, true: utils.compute_correct_per_class(out, true, len(label_counts))
     best_model = None
     t = trange(args.nepochs)
     for i in t:
@@ -146,9 +166,9 @@ def distill(student_model, train_loader, val_loader, base_metric, args):
             x,y = batch
             x = x.to(args.device)
             z_ = student_model(x).detach().cpu()
-            val_correct += float(utils.compute_correct(z_,y))
+            val_correct += metric(z_,y)
             count += x.shape[0]         
-        val_acc = val_correct / count
+        val_acc = np.nanmean(val_correct / label_counts)
 
         old_lr = optimizer.param_groups[0]['lr']
         scheduler.step(val_acc)
@@ -188,7 +208,7 @@ def iterative_distillation(student_model:StudentModelWrapper, bottleneck_layer_i
         print('bottleneck_size = %d' % bottleneck_size)
         logger.info('bottleneck_size = %d' % bottleneck_size)   
         gpu_mem = torch.cuda.memory_allocated(args.device)
-        metric = distill(student_model, train_loader, val_loader, base_metric, args)
+        metric = distill(student_model, train_loader, val_loader, base_metric, nclasses, args)
         torch.cuda.ipc_collect()
         print('\nchange in mem after distillation:%d\t%d\n' % (torch.cuda.memory_allocated(args.device) - gpu_mem, torch.cuda.memory_allocated()))
         logger.info('current metric = %.4f base_metric = %.4f' % (metric, base_metric))
@@ -216,7 +236,7 @@ def iterative_distillation(student_model:StudentModelWrapper, bottleneck_layer_i
     
     student_model = student_model.to(args.device) 
     
-    val_metric = evaluate(student_model, val_dataset, args)
+    val_metric = evaluate(student_model, val_dataset, args, nclasses)
     print('val_metric:', val_metric)
     delta = val_metric - base_metric
     if delta >= args.tol:
@@ -227,7 +247,7 @@ def iterative_distillation(student_model:StudentModelWrapper, bottleneck_layer_i
     return student_model
 
 def simple_distillation(teacher_model: models.ModelWrapper, student_model, train_dataset, val_dataset, nclasses, args):
-    base_metric = evaluate(teacher_model, val_dataset, args)
+    base_metric = evaluate(teacher_model, val_dataset, args, nclasses)
     print('base_metric = %.4f' % (base_metric))
     logger.info('base_metric = %.4f' % (base_metric))
     distill(student_model, teacher_model, train_dataset, val_dataset, base_metric, args) 
@@ -241,10 +261,10 @@ def main(args):
     teacher_model = torch.load(args.teacher_model_file).to(args.device) 
     teacher_model = teacher_model.eval()
     
-    base_metric = evaluate(teacher_model, val_dataset, args)
+    base_metric = evaluate(teacher_model, val_dataset, args, nclasses)
+    print(base_metric)
     print('base_metric = %.4f' % (base_metric))
     logger.info('base_metric = %.4f' % (base_metric))
-
     train_logits = get_logits(teacher_model, train_dataset, args)
     teacher_model = teacher_model.cpu()
     
@@ -274,7 +294,7 @@ def main(args):
     
 
     print(student_model)
-    test_metric = evaluate(student_model, test_dataset, args)
+    test_metric = evaluate(student_model, test_dataset, args, nclasses)
     print('test_metric = %.4f' % (test_metric))
     logger.info('test_metric = %.4f' % (test_metric))
 
