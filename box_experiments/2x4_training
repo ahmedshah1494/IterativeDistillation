@@ -1,0 +1,22 @@
+2019-10-22 01:04:18,673 [MainThread  ] [INFO ]  Namespace(T=1, base_metric=0.1, fat_mlp=True, fat_mlp_width=8, fine_tune=False, img_name='2x16', initialize_opt=False, iterative_distillation=False, logfile='2x4_training', loss_weight=0.25, lr=0.01, model_name='2x8', model_path=None, nepochs=25, opt_mlp=False, patience=1, shrink_factor=0.9, teacher_model=None, tol=0.0, train_layers=[0, 2])
+2019-10-22 01:04:23,207 [MainThread  ] [INFO ]  > epoch=0 training_loss=0.3845 validation_loss=0.3654
+2019-10-22 01:04:24,954 [MainThread  ] [INFO ]  > epoch=1 training_loss=0.2654 validation_loss=0.2624
+2019-10-22 01:04:26,638 [MainThread  ] [INFO ]  > epoch=2 training_loss=0.1752 validation_loss=0.2026
+2019-10-22 01:04:28,433 [MainThread  ] [INFO ]  > epoch=3 training_loss=0.1707 validation_loss=0.1731
+2019-10-22 01:04:30,420 [MainThread  ] [INFO ]  > epoch=4 training_loss=0.1461 validation_loss=0.1401
+2019-10-22 01:04:32,313 [MainThread  ] [INFO ]  > epoch=5 training_loss=0.1273 validation_loss=0.1285
+2019-10-22 01:04:34,214 [MainThread  ] [INFO ]  > epoch=6 training_loss=0.1245 validation_loss=0.1302
+2019-10-22 01:04:36,122 [MainThread  ] [INFO ]  > epoch=7 training_loss=0.1251 validation_loss=0.1252
+2019-10-22 01:04:38,013 [MainThread  ] [INFO ]  > epoch=8 training_loss=0.1083 validation_loss=0.1231
+2019-10-22 01:04:55,824 [MainThread  ] [INFO ]  Namespace(T=1, base_metric=0.1, fat_mlp=True, fat_mlp_width=4, fine_tune=False, img_name='2x4', initialize_opt=False, iterative_distillation=False, logfile='2x4_training', loss_weight=0.25, lr=0.01, model_name='2x4', model_path=None, nepochs=25, opt_mlp=False, patience=1, shrink_factor=0.9, teacher_model=None, tol=0.0, train_layers=[0, 2])
+2019-10-22 01:05:01,364 [MainThread  ] [INFO ]  > epoch=0 training_loss=0.5599 validation_loss=0.5546
+2019-10-22 01:05:03,621 [MainThread  ] [INFO ]  > epoch=1 training_loss=0.5421 validation_loss=0.5547
+2019-10-22 01:05:05,674 [MainThread  ] [INFO ]  > epoch=2 training_loss=0.5762 validation_loss=0.5558
+2019-10-22 01:05:07,644 [MainThread  ] [INFO ]  > epoch=3 training_loss=0.5527 validation_loss=0.5550
+2019-10-22 01:05:09,643 [MainThread  ] [INFO ]  > epoch=4 training_loss=0.5374 validation_loss=0.5547
+2019-10-22 01:05:11,569 [MainThread  ] [INFO ]  > epoch=5 training_loss=0.5585 validation_loss=0.5548
+2019-10-22 01:05:13,733 [MainThread  ] [INFO ]  > epoch=6 training_loss=0.5464 validation_loss=0.5547
+2019-10-22 01:05:15,964 [MainThread  ] [INFO ]  > epoch=7 training_loss=0.5601 validation_loss=0.5551
+2019-10-22 01:05:17,984 [MainThread  ] [INFO ]  > epoch=8 training_loss=0.5581 validation_loss=0.5547
+2019-10-22 01:05:20,063 [MainThread  ] [INFO ]  > epoch=9 training_loss=0.5729 validation_loss=0.5547
+2019-10-22 01:05:22,155 [MainThread  ] [INFO ]  > epoch=10 training_loss=0.5656 validation_loss=0.5554

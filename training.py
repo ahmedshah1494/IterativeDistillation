@@ -112,13 +112,9 @@ def train(model, train_dataset, test_dataset, nclasses, args, val_dataset=None):
 
             logger.info('epoch#%d train_loss=%.3f train_acc=%.3f val_acc=%.3f lr=%.4f' % (i, epoch_loss, epoch_acc, val_acc, optimizer.param_groups[0]['lr']))
     
-    if args.test_pc < 1:
-        new_test_size = int(args.test_pc * len(test_dataset))
-        test_dataset, _ = random_split(test_dataset, [new_test_size, len(test_dataset)-new_test_size])
     test_loader = DataLoader(test_dataset, args.batch_size, shuffle=False, num_workers=(cpu_count())//2)
 
-    test_label_counts = utils.label_counts(test_loader, nclasses)
-    
+    test_label_counts = utils.label_counts(test_loader, nclasses)    
     test_correct = evaluate(model, test_loader, test_label_counts)
     test_acc = np.mean(test_correct / test_label_counts)
     print('test_accuracy:', test_acc)
@@ -127,6 +123,14 @@ def train(model, train_dataset, test_dataset, nclasses, args, val_dataset=None):
 
 def main(args):
     train_dataset, test_dataset, nclasses = utils.get_datasets(args)
+
+    if args.test_pc < 1:
+        new_test_size = int(args.test_pc * len(test_dataset))
+        test_dataset, _ = random_split(test_dataset, [new_test_size, len(test_dataset)-new_test_size])
+
+    new_train_size = int(0.8*len(train_dataset))
+    val_size = len(train_dataset) - new_train_size
+    train_dataset, val_dataset = random_split(train_dataset, [new_train_size, val_size])
 
     if args.model_path is not None:
         model = torch.load(args.model_path)        
@@ -144,7 +148,7 @@ def main(args):
     if use_cuda:        
         model = model.cuda()
     logger.info(model)
-    train(model, train_dataset, test_dataset, nclasses, args)
+    train(model, train_dataset, test_dataset, nclasses, args, val_dataset)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
