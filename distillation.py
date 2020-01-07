@@ -15,8 +15,9 @@ from copy import deepcopy
 import os
 
 class StudentModelWrapper(nn.Module, models.ModelWrapper):
-    def __init__(self, model):
+    def __init__(self, model, logger):
         super(StudentModelWrapper, self).__init__()        
+        self.logger = logger
         containers = [nn.Sequential, nn.ModuleList, nn.ModuleDict, type(model)]
         is_container = lambda m: 1 in [isinstance(m,t) for t in containers]
         layers = [m for m in model.modules() if not is_container(m)]
@@ -27,6 +28,26 @@ class StudentModelWrapper(nn.Module, models.ModelWrapper):
     
     def forward(self, x):
         return self.layers(x)
+
+class StudentModelWrapper2(nn.Module, models.ModelWrapper2):
+    def __init__(self, model, logger):
+        super(StudentModelWrapper2, self).__init__()        
+        self.logger = logger
+        containers = [nn.Sequential, nn.ModuleList, nn.ModuleDict, type(model)]
+        is_container = lambda m: 1 in [isinstance(m,t) for t in containers]
+        layers = [m for m in model.modules() if not is_container(m)]
+        for i,l in enumerate(layers):
+            if isinstance(l, nn.AdaptiveAvgPool2d) and i < len(layers)-1 and not isinstance(layers[i+1], models.Flatten):
+                layers.insert(i+1, models.Flatten())
+        self.layers = nn.Sequential(*layers)
+    
+    def forward(self, x):
+        return self.layers(x)
+    
+    def to(self, device):
+        self.device = device
+        return super(StudentModelWrapper2, self).to(device)
+        
 
 def cross_entropy(logits_p, logits_q, T):
     p = F.softmax(logits_p/T, dim=1)
@@ -201,25 +222,34 @@ def iterative_distillation(student_model:StudentModelWrapper, bottleneck_layer_i
     print(student_model) 
     
     torch.save(student_model, args.outfile)
+    student_model = student_model.to(args.device)
 
     print('shrinking layer %d...' % bottleneck_layer_idx)    
     logger.info('shrinking layer %d...' % bottleneck_layer_idx)
 
     gpu_mem = torch.cuda.memory_allocated(args.device)
-    if not student_model.shrink_layer(bottleneck_layer_idx, factor=args.shrink_factor):
+    
+    bottleneck_size,_ = utils.get_layer_input_output_size(student_model.layers[bottleneck_layer_idx])
+    
+    batch_idx = np.random.permutation(np.arange(len(train_dataset)))[:args.salience_check_samples]
+    batch = [train_dataset[i] for i in batch_idx]
+    batch = [x[0] for x in batch]
+    batch_loader = DataLoader(batch, args.batch_size)
+
+    if not student_model.shrink_layer(bottleneck_layer_idx, batch_loader, factor=args.shrink_factor):
         return student_model
     torch.cuda.ipc_collect()
     print('\nchange in mem after shrinking:%d\t%d\n' % (torch.cuda.memory_allocated(args.device) - gpu_mem, torch.cuda.memory_allocated()))
 
-    print(student_model)   
+    
     student_model = student_model.to(args.device)
     bottleneck_size,_ = utils.get_layer_input_output_size(student_model.layers[bottleneck_layer_idx])
-    
+    print(student_model, bottleneck_size)   
     delta = 0
     break_next_iter = False
     while (bottleneck_size > 0):  
         print('bottleneck_size = %d' % bottleneck_size)
-        logger.info('bottleneck_size = %d' % bottleneck_size)   
+        logger.info('bottleneck_size = %d' % bottleneck_size)        
         gpu_mem = torch.cuda.memory_allocated(args.device)
         metric = distill(student_model, train_loader, val_loader, base_metric, args, val_metric_fn)
         torch.cuda.ipc_collect()
@@ -242,7 +272,7 @@ def iterative_distillation(student_model:StudentModelWrapper, bottleneck_layer_i
                 train_loader = DataLoader(train_dataset, args.batch_size, num_workers=cpu_count()//2, shuffle=True)
 
         gpu_mem = torch.cuda.memory_allocated(args.device)
-        if break_next_iter or not student_model.shrink_layer(bottleneck_layer_idx, factor=args.shrink_factor):
+        if break_next_iter or not student_model.shrink_layer(bottleneck_layer_idx, batch_loader, factor=args.shrink_factor):
             if break_next_iter:
                 break
             else:
@@ -299,7 +329,10 @@ def main(args):
     
     if args.student_model_file is None:
         student_model = copy_model(teacher_model, args.device, reinitialize=(not args.retain_teacher_weights))
-        student_model = StudentModelWrapper(student_model)
+        if args.predictive_pruning:
+            student_model = StudentModelWrapper2(student_model, logger)
+        else:
+            student_model = StudentModelWrapper(student_model, logger)
         for param in student_model.parameters():
             param.requires_grad = True
     else:
@@ -346,6 +379,7 @@ if __name__ == '__main__':
     parser.add_argument('--nepochs', type=int, default=50)
     parser.add_argument('--n_fine_tune_epochs', type=int, default=10)
     parser.add_argument('--batch_size', type=int, default=256)
+    parser.add_argument('--salience_check_samples', type=int, default=256)
     parser.add_argument('--patience', type=int, default=5)
     parser.add_argument('--optimizer', type=str, default='adam', help='adam/sgd')
     parser.add_argument('--soft_loss_type', type=str, default='xent', help='xent/rmse')
@@ -368,6 +402,7 @@ if __name__ == '__main__':
     parser.add_argument('--exclude_layers', nargs='+', type=int, default=[])
     parser.add_argument('--increase_loss_weight', action='store_true')
     parser.add_argument('--anneal_temperature', action='store_true')
+    parser.add_argument('--predictive_pruning', action='store_true')
     parser.add_argument('--test_only', action='store_true')
     args = parser.parse_args()
 
