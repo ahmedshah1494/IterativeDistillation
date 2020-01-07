@@ -4,13 +4,14 @@ import numpy as np
 import torchvision
 import utils
 import types
+import time
 
 class ModelWrapper(object):
     def __init__(self):
         super(ModelWrapper, self).__init__()
 
         self.layers = []
-        
+        self.device = None
     def get_shrinkable_layers(self, non_shrinkables=[]):
         shrinkable_layers = [i for i,l in enumerate(self.layers[:-1]) if utils.is_output_modifiable(l) and i not in non_shrinkables]
         return shrinkable_layers
@@ -30,7 +31,7 @@ class ModelWrapper(object):
         self.__delattr__('layers')
         self.layers = nn.Sequential(*layers)
 
-    def shrink_layer(self, i, factor=1, difference=0):
+    def shrink_layer(self, i, data, factor=1, difference=0):
         if i == len(self.layers)-1 or i == -1:
             raise IndexError('Can not shrink output layer')
         out_size, _ = utils.get_layer_input_output_size(self.layers[i])         
@@ -59,6 +60,211 @@ class ModelWrapper(object):
                     if not isinstance(self.layers[i], nn.BatchNorm2d):
                         break
             return True
+
+class ModelWrapper2(ModelWrapper):
+    def __init__(self):
+        super(ModelWrapper2, self).__init__()
+        self.layers = []
+        self.device = None
+
+    def estimate_z(self, Z_, zj):
+        q,_ = torch.qr(Z_)
+        zh = q.mm(q.transpose(0,1)).mm(zj)
+        return zh
+    
+    def compute_prune_probability(self, i, data):
+        trunc_model = self.layers[:i+1]
+        Zs = []
+        for batch in data:
+            batch = batch.to(self.device)
+            Z = trunc_model(batch)
+            Zs.append(Z.detach())
+        Z = torch.cat(Zs,dim=0)
+
+        Z = Z.permute([j for j in range(len(Z.shape)) if j != 1]+[1])
+        Z = Z.contiguous().view(-1, Z.shape[-1])
+        Z = Z[:Z.shape[1]]
+        # print(Z.shape)
+
+        scores = []
+        for j in range(Z.shape[1]):
+            idxs = [k for k in range(Z.shape[1]) if j != k]
+            Z_ = Z[:,idxs]
+            zj = Z[:, [j]]
+            zh = self.estimate_z(Z_, zj)
+            error = torch.norm((zj-zh)).detach().cpu()
+            scores.append(-error)
+        print('L2: max=%f median=%f min=%f' % (np.max(scores), np.median(scores), np.min(scores)))
+        self.logger.info('L2: max=%f median=%f min=%f' % (np.max(scores), np.median(scores), np.min(scores)))
+        return np.array(scores)
+
+    def remove_input_neurons(self, layer_idx, neuron_idxs):
+        outsize, insize = utils.get_layer_input_output_size(self.layers[layer_idx])            
+        retain_idxs = [i for i in range(insize) if i not in neuron_idxs]
+        layer = self.layers[layer_idx]
+        W = layer.weight.data
+        if isinstance(layer, nn.Linear):            
+            W = W[:, retain_idxs]
+            new_layer = nn.Linear(W.shape[1], outsize)
+            new_layer.weight.data = W
+        elif isinstance(layer, nn.BatchNorm2d):
+            W = W[retain_idxs]
+            b = layer.bias[retain_idxs]
+            new_layer = nn.BatchNorm2d(W.shape[0])
+            new_layer.weight.data = W
+            new_layer.bias.data = b
+        elif isinstance(layer, nn.Conv2d):            
+            W = W[:, retain_idxs]
+            new_layer = nn.Conv2d(W.shape[1], outsize,
+                                layer.kernel_size,
+                                layer.stride,
+                                layer.padding,
+                                layer.dilation)
+            new_layer.weight.data = W
+        else:
+            raise NotImplementedError
+        return new_layer
+
+    def remove_output_neurons(self, layer_idx, neuron_idxs):
+        outsize, insize = utils.get_layer_input_output_size(self.layers[layer_idx])            
+        retain_idxs = [i for i in range(outsize) if i not in neuron_idxs]
+        layer = self.layers[layer_idx]
+        
+        W = layer.weight.data
+        W = W[retain_idxs]
+
+        b = layer.bias.data
+        b = b[retain_idxs]
+        if isinstance(layer, nn.Linear):
+            new_layer = nn.Linear(insize, W.shape[0])
+            new_layer.weight.data = W
+            new_layer.bias.data = b
+        elif isinstance(layer, nn.Conv2d):
+            new_layer = nn.Conv2d(insize, W.shape[0],
+                                    layer.kernel_size,
+                                    layer.stride,
+                                    layer.padding,
+                                    layer.dilation)
+            new_layer.weight.data = W
+            new_layer.bias.data = b
+        else:
+            raise NotImplementedError
+
+        return new_layer
+
+    def shrink_layer(self, i, data, factor=1, difference=0):
+        if i == len(self.layers)-1 or i == -1:
+            raise IndexError('Can not shrink output layer')
+        outsize, _ = utils.get_layer_input_output_size(self.layers[i])
+        new_size = int(outsize*factor - difference)
+        salience_scores = self.compute_prune_probability(i, data)
+        prune_probs = utils.Softmax(salience_scores, 0, 1/outsize)
+        # salience_scores = np.random.rand(outsize)
+        # salience_scores /= np.sum(salience_scores)
+        print(salience_scores.shape)        
+        if salience_scores.shape[0] <= 1:
+            return False
+        pruned_neurons = np.random.choice(np.arange(len(salience_scores)), 
+                                            (outsize - new_size), 
+                                            replace=False, p=prune_probs)        
+        print(salience_scores)
+        print(prune_probs)
+        print('mean error in removed neurons: ', np.mean(salience_scores[pruned_neurons]))
+        self.logger.info('mean error in removed neurons: %f' % np.mean(salience_scores[pruned_neurons]))
+        self.layers[i] = self.remove_output_neurons(i, pruned_neurons)
+        k = i+1
+        while not utils.is_input_modifiable(self.layers[k]):
+            k += 1
+        self.layers[k] = self.remove_input_neurons(k, pruned_neurons)
+        outsize, insize = utils.get_layer_input_output_size(self.layers[i])
+        return True
+
+# class ModelWrapper2(ModelWrapper):
+#     def __init__(self):
+#         super(ModelWrapper2, self).__init__()
+
+#         self.layers = []
+    
+#     def estimate_z(self, Z_, zj):
+#         # return torch.mm(torch.mm(Z_,torch.pinverse(Z_)), zj)
+#         q,_ = torch.qr(Z_)
+#         zh = q.mm(q.transpose(0,1)).mm(zj)
+#         return zh
+
+#     def compute_saliency_scores(self, i, data):
+#         trunc_model = self.layers[:i+1]
+#         Z = trunc_model(data)
+#         scores = []
+#         weight_idxs = np.arange(Z.shape[1]) #np.random.choice(range(Z.shape[1]), Z.shape[0], replace=False)
+#         for k,j in enumerate(weight_idxs):            
+#             idxs = list(range(Z.shape[1]))
+#             idxs.remove(j)
+#             Z_ = Z[:, idxs]
+#             zj = Z[:,[j]]
+#             zh = self.estimate_z(Z_, zj)
+#             error = -torch.norm(zj-zh).detach().cpu()
+#             scores.append(float(error))
+#         scores = softmax(scores)
+#         sorted_idx = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)        
+#         sorted_weight_idx = weight_idxs[sorted_idx]
+#         return sorted_weight_idx
+    
+#     def shrink_input(self, layer_idx, neuron_idxs):
+#         l = self.layers[layer_idx]
+#         if isinstance(l, nn.Linear):
+#             W = l.weight
+#             outsize, insize = W.shape            
+#             idxs = list(range(W.shape[1]))
+#             for ni in neuron_idxs:
+#                 idxs.remove(ni)
+#             W = W[:, idxs]
+#             outsize, insize = W.shape
+#             new_layer = nn.Linear(insize, outsize)
+#             new_layer.weight.data = W
+#         else:
+#             raise NotImplementedError
+#         return new_layer
+    
+#     def shrink_output(self, layer_idx, neuron_idxs):
+#         l = self.layers[layer_idx]
+#         if isinstance(l, nn.Linear):
+#             W = l.weight
+#             outsize, insize = W.shape
+#             idxs = list(range(W.shape[0]))            
+#             for ni in neuron_idxs:
+#                 idxs.remove(ni)
+#             W = W[idxs, :]
+#             outsize, insize = W.shape
+#             new_layer = nn.Linear(insize, outsize)                        
+#             new_layer.weight.data = W
+
+#             idxs = list(range(l.bias.shape[0]))
+#             for ni in neuron_idxs:
+#                 idxs.remove(ni)
+#             new_layer.bias.data = l.bias[idxs]
+#         else:
+#             raise NotImplementedError
+#         return new_layer
+
+#     def shrink_layer(self, i, data, factor=1, difference=0):
+#         if i == len(self.layers)-1 or i == -1:
+#             raise IndexError('Can not shrink output layer')
+#         outsize, _ = utils.get_layer_input_output_size(self.layers[i])
+#         new_size = int(outsize*factor - difference)
+#         print(outsize, new_size)
+#         while outsize > new_size:
+#             t0 = time.time()
+#             sorted_idx = self.compute_saliency_scores(i, data)
+#             print('time for saliency computation', time.time() - t0)
+#             prune_idxs = sorted_idx[:(outsize - new_size)]
+#             self.layers[i] = self.shrink_output(i, prune_idxs)
+#             k = i+1
+#             while not utils.is_input_modifiable(self.layers[k]):
+#                 k += 1
+#             self.layers[k] = self.shrink_input(k, prune_idxs)
+#             outsize, _ = utils.get_layer_input_output_size(self.layers[i])
+#             print(outsize)
+#         return True
 
 class Flatten(nn.Module):
     def __init__(self):
