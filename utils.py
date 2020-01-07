@@ -6,6 +6,7 @@ import torchvision
 from torchvision import transforms
 from PIL import Image
 import os
+from scipy.special import softmax
 
 class AlphaCrossEntropyLoss(nn.Module):
     """docstring for alpha_softmax"""
@@ -202,6 +203,9 @@ def change_layer_input(layer, new_size):
 
     return new_layer
 
+def Softmax(data, axis, T):
+    return softmax(data/T, axis=axis)
+    
 def get_layer_input_output_size(layer):
     if isinstance(layer, nn.Linear):
         return layer.weight.shape
