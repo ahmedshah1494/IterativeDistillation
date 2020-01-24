@@ -374,6 +374,7 @@ def main(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset', type=str)
+    parser.add_argument('--datafolder', type=str,default="/home/mshah1/workhorse3")
     parser.add_argument('--teacher_model_file', type=str)
     parser.add_argument('--student_model_file', type=str)
     parser.add_argument('--nepochs', type=int, default=50)
@@ -392,7 +393,7 @@ if __name__ == '__main__':
     parser.add_argument('--shrink_factor', type=float, default=0.9)
     parser.add_argument('--outfile', type=str, default='models/distillation/distilled_model.pt')
     parser.add_argument('--logfile', type=str, default='logs/distillation/distillation.log')
-    parser.add_argument('--cuda', action='store_true')
+    parser.add_argument('--cuda', action='store_true', default=True)
     parser.add_argument('--retain_teacher_weights', action='store_true')
     parser.add_argument('--shrink_all', action='store_true')
     parser.add_argument('--fine_tune', action='store_true')
@@ -425,7 +426,6 @@ if __name__ == '__main__':
     logger = logging.getLogger()
 
     logger.info(args)
-
     if args.cuda and torch.cuda.is_available():
         args.device = torch.device('cuda')
     else:
