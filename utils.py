@@ -67,9 +67,9 @@ def load_dataset(dataset, augment=False):
     transform = curry(lambda x: torch.from_numpy(np.array(x)).float(), transform)
     if dataset == 'CIFAR10':
         transform = curry(lambda x: x.transpose(2,1).transpose(0,1), transform)
-        train_dataset = torchvision.datasets.CIFAR10('/home/mshah1/workhorse3/', 
+        train_dataset = torchvision.datasets.CIFAR10('%s/'%args.datafolder, 
                     transform=transform, download=True)
-        val_dataset = torchvision.datasets.CIFAR10('/home/mshah1/workhorse3/', train=False,
+        val_dataset = torchvision.datasets.CIFAR10('%s/'%args.datafolder, train=False,
                     transform=transform, download=True)
         input_shape = (-1,*(train_dataset[0][0].shape))
         nclasses = 10
@@ -220,15 +220,15 @@ def get_datasets(args):
     common_transform = get_common_transform()
     test_transform = get_common_transform(training=False)
     if args.dataset == 'cifar10':        
-        train_dataset = torchvision.datasets.CIFAR10('/home/mshah1/workhorse3/', 
+        train_dataset = torchvision.datasets.CIFAR10('%s/'%args.datafolder, 
                     transform=common_transform, download=True)
-        test_dataset = torchvision.datasets.CIFAR10('/home/mshah1/workhorse3/', train=False,
+        test_dataset = torchvision.datasets.CIFAR10('%s/'%args.datafolder, train=False,
                     transform=test_transform, download=True)        
         nclasses = 10
     elif args.dataset == 'cifar100':
-        train_dataset = torchvision.datasets.CIFAR100('/home/mshah1/workhorse3/', 
+        train_dataset = torchvision.datasets.CIFAR100('%s/'%args.datafolder, 
                     transform=common_transform, download=True)
-        test_dataset = torchvision.datasets.CIFAR100('/home/mshah1/workhorse3/', train=False,
+        test_dataset = torchvision.datasets.CIFAR100('%s/'%args.datafolder, train=False,
                     transform=test_transform, download=True)        
         nclasses = 100
     elif 'caltech' in args.dataset:
@@ -264,10 +264,10 @@ def get_datasets(args):
         def is_test_file(fn):
             return is_valid_file(fn) and int(os.path.basename(fn).split('.')[0].split('_')[-1]) > ntrain_files
 
-        train_dataset = torchvision.datasets.ImageFolder('/home/mshah1/workhorse3/%s/' % args.dataset, 
+        train_dataset = torchvision.datasets.ImageFolder('%s/%s/' % (args.datafolder,args.dataset), 
                                                             transform=train_transform,
                                                             is_valid_file= is_train_file)        
-        test_dataset = torchvision.datasets.ImageFolder('/home/mshah1/workhorse3/%s/' % args.dataset, 
+        test_dataset = torchvision.datasets.ImageFolder('%s/%s/' % (args.datafolder,args.dataset), 
                                                             transform=test_transform,
                                                             is_valid_file= is_test_file)
         print(train_dataset[0][0].shape)
@@ -282,9 +282,9 @@ def get_datasets(args):
             # transforms.Resize(224, Image.BICUBIC),
             test_transform
         ])
-        train_dataset = torchvision.datasets.ImageFolder('/home/mshah1/workhorse3/tiny-imagenet-200/train/', 
+        train_dataset = torchvision.datasets.ImageFolder('%s/tiny-imagenet-200/train/'%args.datafolder, 
                                                             transform=train_transform)
-        test_dataset = torchvision.datasets.ImageFolder('/home/mshah1/workhorse3/tiny-imagenet-200/val/', 
+        test_dataset = torchvision.datasets.ImageFolder('%s/tiny-imagenet-200/val/'%args.datafolder, 
                                                             transform=test_transform)
         print(train_dataset[0][0].shape)
         nclasses = 200
