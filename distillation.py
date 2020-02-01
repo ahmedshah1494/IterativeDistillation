@@ -30,9 +30,10 @@ class StudentModelWrapper(nn.Module, models.ModelWrapper):
         return self.layers(x)
 
 class StudentModelWrapper2(nn.Module, models.ModelWrapper2):
-    def __init__(self, model, logger):
-        super(StudentModelWrapper2, self).__init__()        
+    def __init__(self, model, logger, args):
+        super(StudentModelWrapper2, self).__init__()
         self.logger = logger
+        self.args = args
         containers = [nn.Sequential, nn.ModuleList, nn.ModuleDict, type(model)]
         is_container = lambda m: 1 in [isinstance(m,t) for t in containers]
         layers = [m for m in model.modules() if not is_container(m)]
@@ -145,10 +146,7 @@ def distill(student_model, train_loader, val_loader, base_metric, args, val_metr
             optimizer.zero_grad()
             x = x.to(args.device)
             z_ = student_model(x)
-            del x
-
             y, z = y.to(args.device), z.to(args.device)
-            
             train_loss, train_soft_loss, train_hard_loss = criterion(z_, z, y, 
                                                                     loss_weight=loss_w, 
                                                                     C=args.C, T=T, 
@@ -231,7 +229,7 @@ def iterative_distillation(student_model:StudentModelWrapper, bottleneck_layer_i
     
     bottleneck_size,_ = utils.get_layer_input_output_size(student_model.layers[bottleneck_layer_idx])
     
-    batch_idx = np.random.permutation(np.arange(len(train_dataset)))[:args.salience_check_samples]
+    batch_idx = np.random.permutation(np.arange(len(train_dataset)))[:max(bottleneck_size, args.salience_check_samples)]
     batch = [train_dataset[i] for i in batch_idx]
     batch = [x[0] for x in batch]
     batch_loader = DataLoader(batch, args.batch_size)
@@ -240,14 +238,16 @@ def iterative_distillation(student_model:StudentModelWrapper, bottleneck_layer_i
         return student_model
     torch.cuda.ipc_collect()
     print('\nchange in mem after shrinking:%d\t%d\n' % (torch.cuda.memory_allocated(args.device) - gpu_mem, torch.cuda.memory_allocated()))
-
-    
     student_model = student_model.to(args.device)
+    
     bottleneck_size,_ = utils.get_layer_input_output_size(student_model.layers[bottleneck_layer_idx])
     print(student_model, bottleneck_size)   
     delta = 0
     break_next_iter = False
-    while (bottleneck_size > 0):  
+    while (bottleneck_size > 0):
+        val_metric = evaluate(student_model, val_dataset, args, val_metric_fn)
+        print('val_metric:', val_metric)
+
         print('bottleneck_size = %d' % bottleneck_size)
         logger.info('bottleneck_size = %d' % bottleneck_size)        
         gpu_mem = torch.cuda.memory_allocated(args.device)
@@ -330,7 +330,7 @@ def main(args):
     if args.student_model_file is None:
         student_model = copy_model(teacher_model, args.device, reinitialize=(not args.retain_teacher_weights))
         if args.predictive_pruning:
-            student_model = StudentModelWrapper2(student_model, logger)
+            student_model = StudentModelWrapper2(student_model, logger, args)
         else:
             student_model = StudentModelWrapper(student_model, logger)
         for param in student_model.parameters():
@@ -339,6 +339,10 @@ def main(args):
         student_model = torch.load(args.student_model_file)
     del teacher_model
 
+    student_model = student_model.to(args.device)
+    base_metric = evaluate(student_model, val_dataset, args)
+    print('student_base_metric = %.4f' % (base_metric))
+    logger.info('student_base_metric = %.4f' % (base_metric))
     
     shrinkable_layers = student_model.get_shrinkable_layers()
     if args.reverse_shrink_order:
@@ -390,7 +394,7 @@ if __name__ == '__main__':
     parser.add_argument('--max_T', type=float, default=100)
     parser.add_argument('--tol', type=float, default=-0.05)
     parser.add_argument('--shrink_factor', type=float, default=0.9)
-    parser.add_argument('--outfile', type=str, default='models/distillation/distilled_model.pt')
+    parser.add_argument('--outfile', type=str, default='models/distilled/distilled_model.pt')
     parser.add_argument('--logfile', type=str, default='logs/distillation/distillation.log')
     parser.add_argument('--cuda', action='store_true')
     parser.add_argument('--retain_teacher_weights', action='store_true')
@@ -403,6 +407,7 @@ if __name__ == '__main__':
     parser.add_argument('--increase_loss_weight', action='store_true')
     parser.add_argument('--anneal_temperature', action='store_true')
     parser.add_argument('--predictive_pruning', action='store_true')
+    parser.add_argument('--readjust_weights', action='store_true')    
     parser.add_argument('--test_only', action='store_true')
     args = parser.parse_args()
 
