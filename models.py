@@ -95,29 +95,57 @@ class ModelWrapper2(ModelWrapper):
             A *= inv_eye
         else:
             A = init_A
-        L = torch.rand((1,), device=self.device, requires_grad=True)
 
-        A_optimizer = torch.optim.Adam([A, ], lr=1e-2)
+        regularizer_weight = 1e-4
+        A_optimizer = torch.optim.Adam([A, ], lr=1e-3, weight_decay=regularizer_weight)
 
         A.requires_grad = True
-        L.requires_grad = True
                 
-        avg_error = torch.zeros((size,), device=self.device)
-        criterion = lambda x,y: ((x-y)**2).sum(0).mean() + 0.0001*torch.abs(A).mean()
+        avg_error = torch.zeros((size,), device=self.device)        
+        criterion = lambda x,y: torch.norm(x-y, p=2, dim=0).mean() #+ regularizer_weight * torch.norm(A, p=1, dim=0).mean()
         prev_error = sys.maxsize
-        for e in range(100):
-            A_optimizer.zero_grad()
-            error = criterion(Z, Z.mm(A))
-            loss = error
-            loss.backward()
-            A.grad *= inv_eye
-            A_optimizer.step()
-            if error > prev_error:
-                break
+
+        dataset = TensorDataset(Z)
+        loader = DataLoader(Z, batch_size=128, shuffle=True)
+        patience = 5
+        bad_iters = 0
+        for e in range(500):
+            avg_loss = 0
+            for bi,z in enumerate(loader):
+                z = z.cuda()
+                A_optimizer.zero_grad()
+                error = criterion(z, z.mm(A))
+                loss = error
+                loss.backward()
+                A.grad *= inv_eye
+                A_optimizer.step()
+
+                avg_loss = (bi*avg_loss + loss)/(bi+1)
+            print(e+1, float(avg_loss), float(torch.norm(A, p=1, dim=0).mean()), bad_iters)
+            if avg_loss > prev_error:
+                if bad_iters >= patience -1:
+                    break
+                else:
+                    bad_iters += 1
             else:
-                prev_error = error
+                bad_iters = 0
+                prev_error = avg_loss
+        
+        avg_error = 0
+        for bi,z in enumerate(loader):
+            z = z.cuda()
+            avg_error += torch.norm(z-z.mm(A), p=2, dim=0).detach().cpu().numpy()
+        avg_error /= A.shape[0]
+
         A = A.detach()
-        avg_error = torch.sqrt(((Z-Z.mm(A))**2).sum(0)).detach().cpu().numpy()
+        hist, bins = np.histogram(A.cpu().numpy().reshape(-1), bins=10)
+        print('A_hist:', list(zip(hist.tolist(), bins.tolist())))
+        hist, bins = np.histogram(avg_error.reshape(-1), bins=10)
+        print('error_hist:', list(zip(hist.tolist(), bins.tolist())))
+
+        A.to(self.device)
+        # avg_error = torch.sqrt(((Z-Z.mm(A))**2).sum(0)).detach().cpu().numpy()
+        # avg_error /= A.shape[0]
         scores = -1 * avg_error
         return A, scores
     
@@ -127,37 +155,71 @@ class ModelWrapper2(ModelWrapper):
         for batch in data:
             batch = batch.to(self.device)
             Z = trunc_model(batch)
-            Zs.append(Z.detach())
+            Zs.append(Z.detach().cpu())
         Z = torch.cat(Zs,dim=0)
 
         Z = Z.permute([j for j in range(len(Z.shape)) if j != 1]+[1])
-        Z = Z.contiguous().view(-1, Z.shape[-1])        
+        Z = Z.contiguous().view(-1, Z.shape[-1])
+
+        ones = torch.ones((Z.shape[0],1), device=Z.device)
+        Z = torch.cat((Z,ones), dim=1)
+        
         A, scores = self.score_neurons(Z)
+        scores = scores[:-1]
+
+        Z = Z.detach().cpu().numpy()
+
         print('L2: max=%f median=%f min=%f' % (np.max(scores), np.median(scores), np.min(scores)))
         self.logger.info('L2: max=%f median=%f min=%f' % (np.max(scores), np.median(scores), np.min(scores)))
-        return A, np.array(scores), Z
+        return A, np.array(scores), np.mean(np.abs(Z), axis=0)
 
-    def adjust_weights(self, W, A, J):
+    def adjust_weights(self, W, A, J, mean_Z):
         J = sorted(J)
         d = W.shape[1]
         w_norm = init_w_norm = torch.norm(W,dim=1).mean()        
-        for ji, j in enumerate(J):
-            if w_norm / init_w_norm > 2:
-                break
-            print(ji, 'Aj = ', float((1-A[:,j]*A[j]).min()), float((1-A[:,j]*A[j]).max()))
-            print(ji, 'W =', float(W.min()), float(W.max()))
-            print('')
+        for ji, j in enumerate(J):            
+            # print(ji, 'Aj = ', float((1-A[:,j]*A[j]).min()), float((1-A[:,j]*A[j]).max()))
+            # print(ji, 'W =', float(W.min()), float(W.max()))
+            # print('')
 
-            j -= d-W.shape[1]        
+            j -= d-W.shape[1]
+            print(j, A.shape)
             bJ = [i for i in range(W.shape[1]) if i != j]
 
             # method 1
-            W += (A[:,[j]].mm(W.transpose(0,1)[[j]])).transpose(0,1)
+            w_update = (A[:,[j]].mm(W.transpose(0,1)[[j]])).transpose(0,1)
+            update_norm = torch.norm(w_update, p=2, dim=1).mean()
+            print('update_norm:', update_norm)
+            
+            if update_norm > 1 and update_norm > w_norm:
+                print('update norm too large, breaking...')
+                break
+            
+            W += w_update
             W = W[:,bJ]
-            inv_eye = (1-torch.eye(A.shape[1], device=A.device))
+            inv_eye = (1-torch.eye(A.shape[1], device=A.device))            
+
+            future_error = (torch.abs(A[:, j]) * mean_Z[j]).mean()
+            print('future error: %.4f' % future_error)
+            if future_error > 1.0:
+                break
 
             A += (A[:,[j]].mm(A[[j]]) * inv_eye)/(1-A[:,j]*A[j])
             A = A[bJ][:,bJ]
+
+            # M = torch.ones(A.shape, device=A.device)
+            # M[:, j] *= 0 
+            # I = torch.eye(A.shape[1], device=A.device)
+            # U = I*M + (1-M).transpose(0,1) * A * M
+            # AbJ = (1-M).transpose(0,1) * A * (1-M)
+            # V = I - AbJ
+            # T = torch.inverse(V).mm(U)
+            # print((U*inv_eye).nonzero())
+            # print((AbJ*inv_eye).nonzero())
+            # print((V*inv_eye).nonzero())
+            # A = (1/(1-torch.diag(T))).view(-1,1)*(T*(1-I))
+            # A = A[bJ][:, bJ]
+            # A = T.mm(A)[bJ][:, bJ]
 
             if not torch.isfinite(A).any():
                 print('A =',A)
@@ -173,18 +235,24 @@ class ModelWrapper2(ModelWrapper):
         print('change in weight norm: %.4f -> %.4f' % (init_w_norm, w_norm))
         return W
 
-    def remove_input_neurons(self, layer_idx, neuron_idxs, A=None):
+    def remove_input_neurons(self, layer_idx, neuron_idxs, A=None, mean_Z=None):
         outsize, insize = utils.get_layer_input_output_size(self.layers[layer_idx])            
         retain_idxs = [i for i in range(insize) if i not in neuron_idxs]
         layer = self.layers[layer_idx]
+        if len(retain_idxs) == 0:
+            return layer
         W = layer.weight.data
+        b = layer.bias.data
         if isinstance(layer, nn.Linear):
             if A is not None:
-                W = self.adjust_weights(W, A, neuron_idxs)
+                W = torch.cat((W, b.view(-1,1)), dim=1)
+                W = self.adjust_weights(W, A, neuron_idxs, mean_Z)
+                W, b = W[:,:-1], W[:,-1]
             else:
                 W = W[:, retain_idxs]
             new_layer = nn.Linear(W.shape[1], outsize)
-            new_layer.weight.data = W            
+            new_layer.weight.data = W
+            new_layer.bias.data = b
         elif isinstance(layer, nn.BatchNorm2d):
             W = W[retain_idxs]
             b = layer.bias[retain_idxs]
@@ -199,6 +267,7 @@ class ModelWrapper2(ModelWrapper):
                                 layer.padding,
                                 layer.dilation)
             new_layer.weight.data = W
+            new_layer.bias.data = b
         else:
             raise NotImplementedError
         return new_layer
@@ -207,6 +276,9 @@ class ModelWrapper2(ModelWrapper):
         outsize, insize = utils.get_layer_input_output_size(self.layers[layer_idx])            
         retain_idxs = [i for i in range(outsize) if i not in neuron_idxs]
         layer = self.layers[layer_idx]
+
+        if len(retain_idxs) == 0:
+            return layer
         
         W = layer.weight.data
         W = W[retain_idxs]
@@ -235,143 +307,67 @@ class ModelWrapper2(ModelWrapper):
             raise IndexError('Can not shrink output layer')
         outsize, _ = utils.get_layer_input_output_size(self.layers[i])
         new_size = int(outsize*factor - difference)
-        A, salience_scores, Z = self.compute_prune_probability(i, data)
-        prune_probs = utils.Softmax(salience_scores, 0, 50)
+        if self.args.readjust_weights:
+            A, salience_scores, mean_Z = self.compute_prune_probability(i, data)
+        else:
+            _, salience_scores, _ = self.compute_prune_probability(i, data)
+
+
+        prune_probs = utils.Softmax(salience_scores, 0, 1)
+
         # salience_scores = np.random.rand(outsize)
         # salience_scores /= np.sum(salience_scores)
         print(salience_scores.shape)        
         if salience_scores.shape[0] <= 1:
             return False
-        pruned_neurons = np.random.choice(np.arange(len(salience_scores)), 
-                                            (outsize - new_size), 
-                                            replace=False, p=prune_probs)        
-        print(salience_scores)
-        print(prune_probs)
+        # pruned_neurons = np.random.choice(np.arange(len(salience_scores)), 
+        #                                     (outsize - new_size), 
+        #                                     replace=False, p=prune_probs)  
+        pruned_neurons = sorted(range(len(salience_scores)), 
+                                    key=lambda k: salience_scores[k],
+                                    reverse=True)[:(outsize - new_size)]        
+        # print(salience_scores)
+        # print(salience_scores[pruned_neurons])
         print('mean error in removed neurons: ', np.mean(salience_scores[pruned_neurons]))
         self.logger.info('mean error in removed neurons: %f' % np.mean(salience_scores[pruned_neurons]))
         pruned_neurons = sorted(pruned_neurons)
         
         k = i+1
-        while not utils.is_input_modifiable(self.layers[k]):
-            k += 1
-        
-        _, old_insize = utils.get_layer_input_output_size(self.layers[k])
-        init_w_norm = torch.norm(self.layers[k].weight.data, dim=1).mean()
-        if self.args.readjust_weights:
-            self.layers[k] = self.remove_input_neurons(k, pruned_neurons, A)
-            # for ij,j in enumerate(pruned_neurons):
-            #     _,insize = utils.get_layer_input_output_size(self.layers[k])
-            #     print(ij, j, insize, A.shape, Z.shape)
-            #     j = j-ij
-            #     l = self.remove_input_neurons(k, [j], A)
+        while k < len(self.layers):            
+            if utils.is_input_modifiable(self.layers[k]):
+                _, old_insize = utils.get_layer_input_output_size(self.layers[k])
                 
-            #     bj = [i for i in range(Z.shape[1]) if i != j]
-            #     Z = Z[:, bj]
-            #     A = A[bj][:, bj]
-            #     A,_ = self.score_neurons(Z,A)
+                if self.is_last_conv(i):
+                    num_last_conv_filts = self.layers[i].weight.data.shape[0]            
+                    idxs = np.arange(old_insize).reshape(num_last_conv_filts, -1)
+                    pruned_input_neurons_ = pruned_input_neurons = idxs[pruned_neurons].flatten()                    
+                else:
+                    pruned_input_neurons_ = pruned_input_neurons = pruned_neurons
+                
+                if isinstance(self.layers[k], nn.BatchNorm2d):
+                    pruned_input_neurons = pruned_neurons
 
-            #     w_norm = torch.norm(l.weight.data, dim=1).mean()      
-            #     if w_norm/init_w_norm <= 2:
-            #         self.layers[k] = l
-            #     else:
-            #         break
-        else:
-            self.layers[k] = self.remove_input_neurons(k, pruned_neurons)
-        w_norm = torch.norm(self.layers[k].weight.data, dim=1).mean()
-        print('change in weight norm: %.4f -> %.4f' % (init_w_norm, w_norm))
+                init_w_norm = torch.norm(self.layers[k].weight.data, dim=-1).mean()
+                if self.args.readjust_weights:                    
+                    self.layers[k]= self.remove_input_neurons(k, pruned_neurons, A, mean_Z)                        
+                else:
+                    self.layers[k] = self.remove_input_neurons(k, pruned_input_neurons)
+                pruned_input_neurons = pruned_input_neurons_
 
+                w_norm = torch.norm(self.layers[k].weight.data, dim=-1).mean()
+                print('change in weight norm: %.4f -> %.4f' % (init_w_norm, w_norm))
+
+                if not isinstance(self.layers[k], nn.BatchNorm2d):
+                    break
+            k += 1
         _, new_insize = utils.get_layer_input_output_size(self.layers[k])
         
-        self.layers[i] = self.remove_output_neurons(i, pruned_neurons[:old_insize-new_insize])
+        if self.args.readjust_weights:
+            self.layers[i] = self.remove_output_neurons(i, pruned_neurons[:old_insize-new_insize])
+        else:
+            self.layers[i] = self.remove_output_neurons(i, pruned_neurons)            
         outsize, insize = utils.get_layer_input_output_size(self.layers[i])
         return True
-
-# class ModelWrapper2(ModelWrapper):
-#     def __init__(self):
-#         super(ModelWrapper2, self).__init__()
-
-#         self.layers = []
-    
-#     def estimate_z(self, Z_, zj):
-#         # return torch.mm(torch.mm(Z_,torch.pinverse(Z_)), zj)
-#         q,_ = torch.qr(Z_)
-#         zh = q.mm(q.transpose(0,1)).mm(zj)
-#         return zh
-
-#     def compute_saliency_scores(self, i, data):
-#         trunc_model = self.layers[:i+1]
-#         Z = trunc_model(data)
-#         scores = []
-#         weight_idxs = np.arange(Z.shape[1]) #np.random.choice(range(Z.shape[1]), Z.shape[0], replace=False)
-#         for k,j in enumerate(weight_idxs):            
-#             idxs = list(range(Z.shape[1]))
-#             idxs.remove(j)
-#             Z_ = Z[:, idxs]
-#             zj = Z[:,[j]]
-#             zh = self.estimate_z(Z_, zj)
-#             error = -torch.norm(zj-zh).detach().cpu()
-#             scores.append(float(error))
-#         scores = softmax(scores)
-#         sorted_idx = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)        
-#         sorted_weight_idx = weight_idxs[sorted_idx]
-#         return sorted_weight_idx
-    
-#     def shrink_input(self, layer_idx, neuron_idxs):
-#         l = self.layers[layer_idx]
-#         if isinstance(l, nn.Linear):
-#             W = l.weight
-#             outsize, insize = W.shape            
-#             idxs = list(range(W.shape[1]))
-#             for ni in neuron_idxs:
-#                 idxs.remove(ni)
-#             W = W[:, idxs]
-#             outsize, insize = W.shape
-#             new_layer = nn.Linear(insize, outsize)
-#             new_layer.weight.data = W
-#         else:
-#             raise NotImplementedError
-#         return new_layer
-    
-#     def shrink_output(self, layer_idx, neuron_idxs):
-#         l = self.layers[layer_idx]
-#         if isinstance(l, nn.Linear):
-#             W = l.weight
-#             outsize, insize = W.shape
-#             idxs = list(range(W.shape[0]))            
-#             for ni in neuron_idxs:
-#                 idxs.remove(ni)
-#             W = W[idxs, :]
-#             outsize, insize = W.shape
-#             new_layer = nn.Linear(insize, outsize)                        
-#             new_layer.weight.data = W
-
-#             idxs = list(range(l.bias.shape[0]))
-#             for ni in neuron_idxs:
-#                 idxs.remove(ni)
-#             new_layer.bias.data = l.bias[idxs]
-#         else:
-#             raise NotImplementedError
-#         return new_layer
-
-#     def shrink_layer(self, i, data, factor=1, difference=0):
-#         if i == len(self.layers)-1 or i == -1:
-#             raise IndexError('Can not shrink output layer')
-#         outsize, _ = utils.get_layer_input_output_size(self.layers[i])
-#         new_size = int(outsize*factor - difference)
-#         print(outsize, new_size)
-#         while outsize > new_size:
-#             t0 = time.time()
-#             sorted_idx = self.compute_saliency_scores(i, data)
-#             print('time for saliency computation', time.time() - t0)
-#             prune_idxs = sorted_idx[:(outsize - new_size)]
-#             self.layers[i] = self.shrink_output(i, prune_idxs)
-#             k = i+1
-#             while not utils.is_input_modifiable(self.layers[k]):
-#                 k += 1
-#             self.layers[k] = self.shrink_input(k, prune_idxs)
-#             outsize, _ = utils.get_layer_input_output_size(self.layers[i])
-#             print(outsize)
-#         return True
 
 class Flatten(nn.Module):
     def __init__(self):
