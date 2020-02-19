@@ -120,7 +120,7 @@ def get_logits(model, dataset, args):
     logits = torch.utils.data.TensorDataset(X,Y,Z)
     return logits
 
-def distill(student_model, train_loader, val_loader, base_metric, args, val_metric_fn=utils.compute_correct):    
+def distill(student_model, train_loader, val_loader, base_metric, args, val_metric_fn=utils.compute_correct, logger=None):    
     criterion = distillation_loss
     if args.optimizer == 'adam':
         optimizer = torch.optim.Adam(student_model.parameters(), lr=args.lr, weight_decay=1e-4)
@@ -132,7 +132,7 @@ def distill(student_model, train_loader, val_loader, base_metric, args, val_metr
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', patience=args.patience, factor=0.5)
 
     best_model = None
-    t = trange(args.nepochs)
+    t = range(args.nepochs)
     T = args.T
     loss_w = args.loss_weight
     for i in t:
@@ -185,18 +185,21 @@ def distill(student_model, train_loader, val_loader, base_metric, args, val_metr
         if args.anneal_temperature:
             T -= (args.T-1) / args.nepochs
 
-        t.set_postfix(train_loss=epoch_loss, train_soft_loss=epoch_soft_loss, train_hard_loss=epoch_hard_loss, 
-                        val_acc=val_acc, lr=optimizer.param_groups[0]['lr'], T=T, lossW=loss_w)        
-        if i % 10 == 0:
-            if 'logger' in locals():
-                logger.info('epoch#%d train_loss=%.3f train_hard_loss=%.3f train_soft_loss=%.3f val_acc=%.3f lr=%.4f' % (i, epoch_loss, epoch_hard_loss, epoch_soft_loss, val_acc, optimizer.param_groups[0]['lr']))
+        # t.set_postfix(train_loss=epoch_loss, train_soft_loss=epoch_soft_loss, train_hard_loss=epoch_hard_loss, 
+        #                 val_acc=val_acc, lr=optimizer.param_groups[0]['lr'], T=T, lossW=loss_w)        
+        # if i % 10 == 0:
+        print('epoch#%d train_loss=%.3f train_hard_loss=%.3f train_soft_loss=%.3f val_acc=%.3f lr=%.4f' % (i, epoch_loss, epoch_hard_loss, epoch_soft_loss, val_acc, optimizer.param_groups[0]['lr']))
+        if logger is not None:
+            logger.info('epoch#%d train_loss=%.3f train_hard_loss=%.3f train_soft_loss=%.3f val_acc=%.3f lr=%.4f' % (i, epoch_loss, epoch_hard_loss, epoch_soft_loss, val_acc, optimizer.param_groups[0]['lr']))
         if val_acc-base_metric >= args.tol:
-            if 'logger' in locals():
+            if logger is not None:
                 logger.info('epoch#%d train_loss=%.3f train_hard_loss=%.3f train_soft_loss=%.3f val_acc=%.3f lr=%.4f' % (i, epoch_loss, epoch_hard_loss, epoch_soft_loss, val_acc, optimizer.param_groups[0]['lr']))
             break
     return scheduler.best
     
-def iterative_distillation(student_model:StudentModelWrapper, bottleneck_layer_idx, train_dataset, val_dataset, test_dataset, nclasses, base_metric, args, mLogger=None, val_metric_fn=utils.compute_correct): 
+def iterative_distillation(student_model:StudentModelWrapper, bottleneck_layer_idx, train_dataset, 
+                            val_dataset, test_dataset, nclasses, base_metric, args, mLogger=None, 
+                            val_metric_fn=utils.compute_correct): 
     if mLogger is not None:
         logger = mLogger
     train_loader = DataLoader(train_dataset, args.batch_size, num_workers=cpu_count()//2, shuffle=True)
@@ -209,7 +212,7 @@ def iterative_distillation(student_model:StudentModelWrapper, bottleneck_layer_i
         nepochs = args.nepochs
         args.nepochs = args.n_fine_tune_epochs        
 
-        metric = distill(student_model, train_loader, val_loader, base_metric, args, val_metric_fn)
+        metric = distill(student_model, train_loader, val_loader, base_metric, args, val_metric_fn, mLogger)
 
         args.loss_weight = loss_w
         args.nepochs = nepochs
@@ -229,11 +232,12 @@ def iterative_distillation(student_model:StudentModelWrapper, bottleneck_layer_i
     
     bottleneck_size,_ = utils.get_layer_input_output_size(student_model.layers[bottleneck_layer_idx])
     
-    batch_idx = np.random.permutation(np.arange(len(train_dataset)))[:max(bottleneck_size, args.salience_check_samples)]
+    batch_idx = np.random.permutation(np.arange(len(train_dataset)))#[:max(bottleneck_size, args.salience_check_samples)]
     batch = [train_dataset[i] for i in batch_idx]
     batch = [x[0] for x in batch]
     batch_loader = DataLoader(batch, args.batch_size)
-
+    
+    torch.cuda.ipc_collect()
     if not student_model.shrink_layer(bottleneck_layer_idx, batch_loader, factor=args.shrink_factor):
         return student_model
     torch.cuda.ipc_collect()
@@ -245,17 +249,22 @@ def iterative_distillation(student_model:StudentModelWrapper, bottleneck_layer_i
     delta = 0
     break_next_iter = False
     while (bottleneck_size > 0):
-        val_metric = evaluate(student_model, val_dataset, args, val_metric_fn)
-        print('val_metric:', val_metric)
+        metric = evaluate(student_model, val_dataset, args, val_metric_fn)
+        print('val_metric:', metric)
+        logger.info('val_metric: %0.4f' % metric)
 
-        print('bottleneck_size = %d' % bottleneck_size)
-        logger.info('bottleneck_size = %d' % bottleneck_size)        
-        gpu_mem = torch.cuda.memory_allocated(args.device)
-        metric = distill(student_model, train_loader, val_loader, base_metric, args, val_metric_fn)
-        torch.cuda.ipc_collect()
+        delta = metric - base_metric
         
-        print('\nchange in mem after distillation:%d\t%d\n' % (torch.cuda.memory_allocated(args.device) - gpu_mem, torch.cuda.memory_allocated()))
-        logger.info('current metric = %.4f base_metric = %.4f' % (metric, base_metric))
+        print('bottleneck_size = %d' % bottleneck_size)
+        logger.info('bottleneck_size = %d' % bottleneck_size)
+        
+        if delta < args.tol:                    
+            gpu_mem = torch.cuda.memory_allocated(args.device)
+            metric = distill(student_model, train_loader, val_loader, base_metric, args, val_metric_fn, mLogger)
+            torch.cuda.ipc_collect()
+            
+            print('\nchange in mem after distillation:%d\t%d\n' % (torch.cuda.memory_allocated(args.device) - gpu_mem, torch.cuda.memory_allocated()))
+            logger.info('current metric = %.4f base_metric = %.4f' % (metric, base_metric))
 
         delta = metric - base_metric
         if args.fine_tune and delta < args.tol:
@@ -272,11 +281,16 @@ def iterative_distillation(student_model:StudentModelWrapper, bottleneck_layer_i
                 train_loader = DataLoader(train_dataset, args.batch_size, num_workers=cpu_count()//2, shuffle=True)
 
         gpu_mem = torch.cuda.memory_allocated(args.device)
+
+        if args.round_robin:
+            break
+
         if break_next_iter or not student_model.shrink_layer(bottleneck_layer_idx, batch_loader, factor=args.shrink_factor):
             if break_next_iter:
                 break
             else:
-                break_next_iter = True
+                break_next_iter = True                
+
         student_model = student_model.to(args.device)
         torch.cuda.ipc_collect()
         print('\nchange in mem after shrinking:%d\t%d\n' % (torch.cuda.memory_allocated(args.device) - gpu_mem, torch.cuda.memory_allocated()))
@@ -285,18 +299,21 @@ def iterative_distillation(student_model:StudentModelWrapper, bottleneck_layer_i
         if new_bottleneck_size == bottleneck_size:
             break
         else:
-            bottleneck_size = new_bottleneck_size
+            bottleneck_size = new_bottleneck_size                
     
     student_model = student_model.to(args.device) 
     
     val_metric = evaluate(student_model, val_dataset, args, val_metric_fn)
     print('val_metric:', val_metric)
     logger.info('val_metric:%f'%val_metric)
+    student_model = student_model.cpu()
+
     delta = val_metric - base_metric
     if delta >= args.tol:
         # logger.info('saving model...')        
         torch.save(student_model, args.outfile)
-
+    del student_model
+    
     student_model = torch.load(args.outfile).to(args.device)    
     return student_model
 
@@ -319,13 +336,11 @@ def main(args):
     teacher_model = torch.load(args.teacher_model_file).to(args.device) 
     teacher_model = teacher_model.eval()
     
-    base_metric = evaluate(teacher_model, val_dataset, args)
-    print('base_metric = %.4f' % (base_metric))
-    logger.info('base_metric = %.4f' % (base_metric))
-    if args.test_only:
-        return
-    train_logits = get_logits(teacher_model, train_dataset, args)
-    teacher_model = teacher_model.cpu()
+    teacher_base_metric = evaluate(teacher_model, val_dataset, args)
+    
+    if not args.test_only:
+        train_logits = get_logits(teacher_model, train_dataset, args)
+        teacher_model = teacher_model.cpu()
     
     if args.student_model_file is None:
         student_model = copy_model(teacher_model, args.device, reinitialize=(not args.retain_teacher_weights))
@@ -340,34 +355,88 @@ def main(args):
     del teacher_model
 
     student_model = student_model.to(args.device)
-    base_metric = evaluate(student_model, val_dataset, args)
-    print('student_base_metric = %.4f' % (base_metric))
-    logger.info('student_base_metric = %.4f' % (base_metric))
+    student_base_metric = evaluate(student_model, val_dataset, args)    
     
-    shrinkable_layers = student_model.get_shrinkable_layers()
+    
+    if args.test_only:
+        return teacher_base_metric, student_base_metric
+
+    base_metric = max(args.base_metric, teacher_base_metric)
+    
+    print('teacher_base_metric = %.4f' % (teacher_base_metric))
+    logger.info('base_metric = %.4f' % (teacher_base_metric))
+    print('student_base_metric = %.4f' % (student_base_metric))
+    logger.info('student_base_metric = %.4f' % student_base_metric)
+    print('base_metric = %.4f' % (base_metric))
+    logger.info('base_metric = %.4f' % base_metric)
+    
+    shrinkable_layers = student_model.get_shrinkable_layers() 
+    not_shrinkables = []       
     if args.reverse_shrink_order:
         shrinkable_layers = shrinkable_layers[::-1]
     if args.shrink_all or len(args.shrink_layer_idxs) > 0:  
-        if len(args.shrink_layer_idxs) > 0:
-            not_shrinkables = [i for i in shrinkable_layers if i not in args.shrink_layer_idxs]
-            shrinkable_layers = args.shrink_layer_idxs
-        else:
-            not_shrinkables = args.exclude_layers            
-        while len(shrinkable_layers) > 0:
-            student_model = iterative_distillation(student_model, shrinkable_layers[0], train_logits, val_dataset, test_dataset, nclasses, base_metric, args, mLogger=logger)
-            if args.train_on_student:
-                train_logits = get_logits(student_model, train_dataset, args)
-            print(student_model)
-            new_shrinkable_layers = student_model.get_shrinkable_layers(not_shrinkables)
-            if args.reverse_shrink_order:
-                new_shrinkable_layers = new_shrinkable_layers[::-1]
-            if shrinkable_layers == new_shrinkable_layers:
-                not_shrinkables.append(shrinkable_layers[0])            
-            shrinkable_layers = [x for x in new_shrinkable_layers if x not in not_shrinkables]            
-            print(not_shrinkables, shrinkable_layers)
+        old_num_params = num_params = sum([p.numel() for p in student_model.parameters()])        
+        # rr_iters = args.round_robin_iters if args.round_robin else 1
+        # for rri in range(rr_iters):
+        rri = 0
+        
+        if args.start_layer_idx >= 0 and args.start_layer_idx in shrinkable_layers:
+            shrinkable_layers = shrinkable_layers[shrinkable_layers.index(args.start_layer_idx):]            
+
+        shrinkable_layers_ = shrinkable_layers
+        while rri == 0 or old_num_params != num_params:
+            shrinkable_layers = shrinkable_layers_
+            if len(args.shrink_layer_idxs) > 0:
+                not_shrinkables = [i for i in shrinkable_layers if i not in args.shrink_layer_idxs]
+                shrinkable_layers = args.shrink_layer_idxs
+            else:
+                not_shrinkables = args.exclude_layers[:]
+        
+                    
+            print(rri, not_shrinkables, shrinkable_layers, args.exclude_layers, args.shrink_layer_idxs)            
+            while len(shrinkable_layers) > 0:
+                student_model = iterative_distillation(student_model, shrinkable_layers[0], train_logits, val_dataset, test_dataset, nclasses, base_metric, args, mLogger=logger)
+                if args.train_on_student:
+                    train_logits = get_logits(student_model, train_dataset, args)
+                print(student_model)
+                new_shrinkable_layers = student_model.get_shrinkable_layers(not_shrinkables)
+                if args.reverse_shrink_order:
+                    new_shrinkable_layers = new_shrinkable_layers[::-1]
+                if shrinkable_layers == new_shrinkable_layers:
+                    not_shrinkables.append(shrinkable_layers[0])            
+                shrinkable_layers = [x for x in new_shrinkable_layers if x not in not_shrinkables]            
+                print(not_shrinkables, shrinkable_layers)
+            
+            if not args.round_robin:
+                break
+
+            old_num_params = num_params
+            num_params = sum([p.numel() for p in student_model.parameters()])
+            num_dense = sum([sum([p.numel() for p in m.parameters()]) for m in student_model.modules() if isinstance(m,nn.Linear)])
+            num_conv = sum([sum([p.numel() for p in m.parameters()]) for m in student_model.modules() if isinstance(m,nn.Conv2d)])
+            print('change in num_params: %d -> %d' % (old_num_params, num_params))
+            logger.info('num params: %d' % num_params)
+            logger.info('num dense: %d' % num_dense)
+            logger.info('num conv: %d' % num_conv)
+            rri += 1
+            
     else:
         student_model = iterative_distillation(student_model, shrinkable_layers[-1], train_logits, val_dataset, test_dataset, nclasses, base_metric, args, mLogger=logger)
-    
+
+    def fine_tune():
+        loss_w = args.loss_weight            
+        args.loss_weight = 1
+
+        nepochs = args.nepochs
+        args.nepochs = args.n_fine_tune_epochs        
+
+        metric = distill(student_model, train_loader, val_loader, base_metric, args, val_metric_fn, logger)
+
+        args.loss_weight = loss_w
+        args.nepochs = nepochs
+        
+        torch.cuda.ipc_collect()
+        return metric
 
     print(student_model)
     test_metric = evaluate(student_model, test_dataset, args)
@@ -386,6 +455,7 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', type=int, default=256)
     parser.add_argument('--salience_check_samples', type=int, default=256)
     parser.add_argument('--patience', type=int, default=5)
+    parser.add_argument('--base_metric', type=float, default=0.0)
     parser.add_argument('--optimizer', type=str, default='adam', help='adam/sgd')
     parser.add_argument('--soft_loss_type', type=str, default='xent', help='xent/rmse')
     parser.add_argument('--lr', type=float, default=0.001)
@@ -402,13 +472,16 @@ if __name__ == '__main__':
     parser.add_argument('--shrink_all', action='store_true')
     parser.add_argument('--fine_tune', action='store_true')
     parser.add_argument('--reverse_shrink_order', action='store_true')
+    parser.add_argument('--round_robin', action='store_true')
+    parser.add_argument('--round_robin_iters', type=int, default=10)
     parser.add_argument('--train_on_student', action='store_true')
     parser.add_argument('--shrink_layer_idxs', nargs='+', type=int, default=[])
+    parser.add_argument('--start_layer_idx', type=int, default=-1)
     parser.add_argument('--exclude_layers', nargs='+', type=int, default=[])
     parser.add_argument('--increase_loss_weight', action='store_true')
     parser.add_argument('--anneal_temperature', action='store_true')
     parser.add_argument('--predictive_pruning', action='store_true')
-    parser.add_argument('--readjust_weights', action='store_true')    
+    parser.add_argument('--readjust_weights', action='store_true')
     parser.add_argument('--test_only', action='store_true')
     args = parser.parse_args()
 
@@ -435,5 +508,5 @@ if __name__ == '__main__':
         args.device = torch.device('cuda')
     else:
         args.device = torch.device('cpu')
-
+    print(args.device)
     main(args)
