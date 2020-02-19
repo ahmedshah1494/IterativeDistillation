@@ -274,13 +274,19 @@ def get_datasets(args):
         
     elif args.dataset == 'tiny_imagenet':
         train_transform = transforms.Compose([
-            # transforms.Resize(224, Image.BICUBIC),
-            transforms.RandomHorizontalFlip(),
-            common_transform
+            transforms.Resize(size=224),
+            # transforms.RandomRotation(degrees=15),
+            # transforms.ColorJitter(),
+            # transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406],
+                                [0.229, 0.224, 0.225])  # Imagenet standards
         ])
+
         test_transform = transforms.Compose([
-            # transforms.Resize(224, Image.BICUBIC),
-            test_transform
+            transforms.Resize(size=224),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
         ])
         train_dataset = torchvision.datasets.ImageFolder('%s/tiny-imagenet-200/train/'%args.datafolder, 
                                                             transform=train_transform)
