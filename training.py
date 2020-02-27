@@ -148,8 +148,22 @@ def main(args):
     if use_cuda:        
         model = model.cuda()
     logger.info(model)
-    train(model, train_dataset, test_dataset, nclasses, args, val_dataset)
 
+    if args.pretrain_classifier_epochs > 0:
+        models.setup_feature_extraction_model(model, args.model, nclasses, args.classifier_depth)
+        
+        if use_cuda:        
+            model = model.cuda()
+
+        nepochs_ = args.nepochs
+        args.nepochs = args.pretrain_classifier_epochs
+        train(model, train_dataset, test_dataset, nclasses, args, val_dataset)
+        args.nepochs = nepochs_
+
+        for param in model.parameters():
+            param.requires_grad = True
+
+    train(model, train_dataset, test_dataset, nclasses, args, val_dataset)
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset', type=str, required=True)
@@ -157,6 +171,7 @@ if __name__ == '__main__':
     parser.add_argument('--model', type=str)
     parser.add_argument('--model_path', type=str)
     parser.add_argument('--nepochs', type=int, default=50)
+    parser.add_argument('--pretrain_classifier_epochs', type=int, default=0)
     parser.add_argument('--patience', type=int, default=5)
     parser.add_argument('--batch_size', type=int, default=256)
     parser.add_argument('--lr', type=float, default=0.001)
