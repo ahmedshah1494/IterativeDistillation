@@ -15,9 +15,10 @@ from copy import deepcopy
 import os
 
 class StudentModelWrapper(nn.Module, models.ModelWrapper):
-    def __init__(self, model, logger):
+    def __init__(self, model, logger, args):
         super(StudentModelWrapper, self).__init__()        
         self.logger = logger
+        self.args = args
         containers = [nn.Sequential, nn.ModuleList, nn.ModuleDict, type(model)]
         is_container = lambda m: 1 in [isinstance(m,t) for t in containers]
         layers = [m for m in model.modules() if not is_container(m)]
@@ -129,7 +130,7 @@ def distill(student_model, train_loader, val_loader, base_metric, args, val_metr
     else:
         raise ValueError('optimizer should be either "adam" or "sgd"')
 
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', patience=args.patience, factor=0.5)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', patience=args.patience, factor=0.5, min_lr=1e-6)
 
     best_model = None
     t = range(args.nepochs)
@@ -188,22 +189,22 @@ def distill(student_model, train_loader, val_loader, base_metric, args, val_metr
         # t.set_postfix(train_loss=epoch_loss, train_soft_loss=epoch_soft_loss, train_hard_loss=epoch_hard_loss, 
         #                 val_acc=val_acc, lr=optimizer.param_groups[0]['lr'], T=T, lossW=loss_w)        
         # if i % 10 == 0:
-        print('epoch#%d train_loss=%.3f train_hard_loss=%.3f train_soft_loss=%.3f val_acc=%.3f lr=%.4f' % (i, epoch_loss, epoch_hard_loss, epoch_soft_loss, val_acc, optimizer.param_groups[0]['lr']))
+        print('epoch#%d train_loss=%.3f train_hard_loss=%.3f train_soft_loss=%.3f val_acc=%.3f lr=%.4E' % (i, epoch_loss, epoch_hard_loss, epoch_soft_loss, val_acc, optimizer.param_groups[0]['lr']))
         if logger is not None:
-            logger.info('epoch#%d train_loss=%.3f train_hard_loss=%.3f train_soft_loss=%.3f val_acc=%.3f lr=%.4f' % (i, epoch_loss, epoch_hard_loss, epoch_soft_loss, val_acc, optimizer.param_groups[0]['lr']))
+            logger.info('epoch#%d train_loss=%.3f train_hard_loss=%.3f train_soft_loss=%.3f val_acc=%.3f lr=%.4E' % (i, epoch_loss, epoch_hard_loss, epoch_soft_loss, val_acc, optimizer.param_groups[0]['lr']))
         if val_acc-base_metric >= args.tol:
             if logger is not None:
-                logger.info('epoch#%d train_loss=%.3f train_hard_loss=%.3f train_soft_loss=%.3f val_acc=%.3f lr=%.4f' % (i, epoch_loss, epoch_hard_loss, epoch_soft_loss, val_acc, optimizer.param_groups[0]['lr']))
+                logger.info('epoch#%d train_loss=%.3f train_hard_loss=%.3f train_soft_loss=%.3f val_acc=%.3f lr=%.4E' % (i, epoch_loss, epoch_hard_loss, epoch_soft_loss, val_acc, optimizer.param_groups[0]['lr']))
             break
-    return scheduler.best
+    return val_acc
     
 def iterative_distillation(student_model:StudentModelWrapper, bottleneck_layer_idx, train_dataset, 
                             val_dataset, test_dataset, nclasses, base_metric, args, mLogger=None, 
                             val_metric_fn=utils.compute_correct): 
     if mLogger is not None:
         logger = mLogger
-    train_loader = DataLoader(train_dataset, args.batch_size, num_workers=cpu_count()//2, shuffle=True)
-    val_loader = DataLoader(val_dataset, args.batch_size, num_workers=cpu_count()//2, shuffle=False)
+    train_loader = DataLoader(train_dataset, args.batch_size, num_workers=cpu_count()//4, shuffle=True)
+    val_loader = DataLoader(val_dataset, args.batch_size, num_workers=cpu_count()//4, shuffle=False)
 
     def fine_tune():
         loss_w = args.loss_weight            
@@ -232,14 +233,16 @@ def iterative_distillation(student_model:StudentModelWrapper, bottleneck_layer_i
     
     bottleneck_size,_ = utils.get_layer_input_output_size(student_model.layers[bottleneck_layer_idx])
     
-    batch_idx = np.random.permutation(np.arange(len(train_dataset)))#[:max(bottleneck_size, args.salience_check_samples)]
+    batch_idx = np.random.permutation(np.arange(len(train_dataset)))[:max(bottleneck_size, args.salience_check_samples)]
     batch = [train_dataset[i] for i in batch_idx]
     batch = [x[0] for x in batch]
     batch_loader = DataLoader(batch, args.batch_size)
     
     torch.cuda.ipc_collect()
+
     if not student_model.shrink_layer(bottleneck_layer_idx, batch_loader, factor=args.shrink_factor):
         return student_model
+        
     torch.cuda.ipc_collect()
     print('\nchange in mem after shrinking:%d\t%d\n' % (torch.cuda.memory_allocated(args.device) - gpu_mem, torch.cuda.memory_allocated()))
     student_model = student_model.to(args.device)
@@ -274,6 +277,8 @@ def iterative_distillation(student_model:StudentModelWrapper, bottleneck_layer_i
             logger.info('tolerance violated; stopping distillation')            
             break
         else:
+            print(student_model, bottleneck_size)   
+            print('saving model...')
             logger.info('saving model...')
             torch.save(student_model, args.outfile)
             if args.train_on_student:
@@ -310,7 +315,8 @@ def iterative_distillation(student_model:StudentModelWrapper, bottleneck_layer_i
 
     delta = val_metric - base_metric
     if delta >= args.tol:
-        # logger.info('saving model...')        
+        print(student_model, bottleneck_size)
+        logger.info('saving model...')        
         torch.save(student_model, args.outfile)
     del student_model
     
@@ -347,13 +353,14 @@ def main(args):
         if args.predictive_pruning:
             student_model = StudentModelWrapper2(student_model, logger, args)
         else:
-            student_model = StudentModelWrapper(student_model, logger)
+            student_model = StudentModelWrapper(student_model, logger, args)
         for param in student_model.parameters():
             param.requires_grad = True
     else:
         student_model = torch.load(args.student_model_file)
     del teacher_model
 
+    student_model.args = args
     student_model = student_model.to(args.device)
     student_base_metric = evaluate(student_model, val_dataset, args)    
     
@@ -379,19 +386,23 @@ def main(args):
         # rr_iters = args.round_robin_iters if args.round_robin else 1
         # for rri in range(rr_iters):
         rri = 0
-        
-        if args.start_layer_idx >= 0 and args.start_layer_idx in shrinkable_layers:
-            shrinkable_layers = shrinkable_layers[shrinkable_layers.index(args.start_layer_idx):]            
 
-        shrinkable_layers_ = shrinkable_layers
+        shrinkable_layers_ = shrinkable_layers        
+
         while rri == 0 or old_num_params != num_params:
-            shrinkable_layers = shrinkable_layers_
+            student_model.reset()
+
+            shrinkable_layers = shrinkable_layers_                    
+
             if len(args.shrink_layer_idxs) > 0:
                 not_shrinkables = [i for i in shrinkable_layers if i not in args.shrink_layer_idxs]
                 shrinkable_layers = args.shrink_layer_idxs
             else:
                 not_shrinkables = args.exclude_layers[:]
-        
+            
+            if rri == 0 and args.start_layer_idx >= 0 and args.start_layer_idx in shrinkable_layers:
+                not_shrinkables += [i for i in shrinkable_layers if i > args.start_layer_idx]
+                shrinkable_layers = shrinkable_layers[shrinkable_layers.index(args.start_layer_idx):]                        
                     
             print(rri, not_shrinkables, shrinkable_layers, args.exclude_layers, args.shrink_layer_idxs)            
             while len(shrinkable_layers) > 0:
@@ -454,7 +465,7 @@ if __name__ == '__main__':
     parser.add_argument('--n_fine_tune_epochs', type=int, default=10)
     parser.add_argument('--batch_size', type=int, default=256)
     parser.add_argument('--salience_check_samples', type=int, default=256)
-    parser.add_argument('--patience', type=int, default=5)
+    parser.add_argument('--patience', type=int, default=3)
     parser.add_argument('--base_metric', type=float, default=0.0)
     parser.add_argument('--optimizer', type=str, default='adam', help='adam/sgd')
     parser.add_argument('--soft_loss_type', type=str, default='xent', help='xent/rmse')
@@ -481,6 +492,9 @@ if __name__ == '__main__':
     parser.add_argument('--increase_loss_weight', action='store_true')
     parser.add_argument('--anneal_temperature', action='store_true')
     parser.add_argument('--predictive_pruning', action='store_true')
+    parser.add_argument('--predictive_pruning_iters', type=int, default=1000)
+    parser.add_argument('--predictive_pruning_batch_size', type=int, default=128)
+    parser.add_argument('--predictive_pruning_lr', type=float, default=1e-3)
     parser.add_argument('--readjust_weights', action='store_true')
     parser.add_argument('--test_only', action='store_true')
     args = parser.parse_args()
