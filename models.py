@@ -69,11 +69,11 @@ class ModelWrapper(object):
             return True
 
 class ModelWrapper2(ModelWrapper):
-    shrinking_state = {
-        'layer_idx': None,
-        'A1': None,
-        'A2': None
-    }
+    # shrinking_state = {
+    #     'layer_idx': None,
+    #     'A1': None,
+    #     'A2': None
+    # }
     def __init__(self):
         super(ModelWrapper2, self).__init__()
         self.layers = []
@@ -95,12 +95,12 @@ class ModelWrapper2(ModelWrapper):
     #         error = torch.norm((zj-zh)).detach().cpu()
     #         scores.append(-error)
     #     return None, scores
-    def update_shrinking_state(self, layer_idx, A1, A2):
-        self.shrinking_state = {
-            'layer_idx': layer_idx,
-            'A1': A1,
-            'A2': A2
-        }
+    # def update_shrinking_state(self, layer_idx, A1, A2):
+    #     self.shrinking_state = {
+    #         'layer_idx': layer_idx,
+    #         'A1': A1,
+    #         'A2': A2
+    #     }
 
     def score_neurons(self, Z, init_A = None):
         size = Z.shape[1]
@@ -167,11 +167,10 @@ class ModelWrapper2(ModelWrapper):
     
     def compute_prune_probability(self, i, data, flatten_conv_map=False, init_A1=None, init_A2=None):        
         k = i
-        while i+1 < len(self.layers):
-            if utils.is_input_modifiable(self.layers[i+1]) or isinstance(self.layers[i+1], Flatten):
-                break
+        while i+1 < len(self.layers) and not utils.is_weighted(self.layers[i+1]) and not isinstance(self.layers[i+1], Flatten) and not isinstance(self.layers[i+1], nn.Dropout):
             i += 1
         trunc_model = self.layers[:i+1]
+        trunc_model = trunc_model.eval()
 
         print('---------------------truncated_layers-----------------------')
         print(self.layers[k:i+1])
@@ -193,13 +192,15 @@ class ModelWrapper2(ModelWrapper):
 
         ones = torch.ones((Z.shape[0],1), device=Z.device)
         Z = torch.cat((Z,ones), dim=1)
+        print('Z.shape =', Z.shape)
         A, scores = self.score_neurons(Z, init_A=init_A)
         scores = scores[:-1]
 
         Z = Z.detach().cpu().numpy()
+        torch.cuda.ipc_collect()
 
         print('L2: max=%f median=%f min=%f' % (np.max(scores), np.median(scores), np.min(scores)))
-        self.logger.info('L2: max=%f median=%f min=%f' % (np.max(scores), np.median(scores), np.min(scores)))
+        # self.logger.info('L2: max=%f median=%f min=%f' % (np.max(scores), np.median(scores), np.min(scores)))
         return A, np.array(scores), np.mean(np.abs(Z), axis=0)
 
     def adjust_weights(self, W, A, J, mean_Z, weight_block_size=1):
@@ -208,7 +209,8 @@ class ModelWrapper2(ModelWrapper):
         w_norm = init_w_norm = torch.norm(W,dim=1).mean()
         W_ = W
         A_ = A
-        for ji, j in enumerate(J):            
+        for ji, j in enumerate(J):
+            torch.cuda.ipc_collect()
             # print(ji, 'Aj = ', float((1-A[:,j]*A[j]).min()), float((1-A[:,j]*A[j]).max()))
             # print(ji, 'W =', float(W.min()), float(W.max()))
             # print('')
@@ -242,15 +244,20 @@ class ModelWrapper2(ModelWrapper):
                 W = W.contiguous().view(permuted_w_shape)
                 W = W.permute(reverse_permutation_order)
 
-            W = W[:,bJ]
-            inv_eye = (1-torch.eye(A.shape[1], device=A.device))             
+            W = W[:,bJ]            
 
             
             print('future error: %.4f' % future_error)
             # if (ji+1) % weight_block_size == weight_block_size-1 and future_error > 1.0:
-            #     break            
+            #     break
 
-            A += (A[:,[j]].mm(A[[j]]) * inv_eye)/(1-A[:,j]*A[j])
+            # inv_eye = (1-torch.eye(A.shape[1], device=A.device))            
+            # A_update = (A[:,[j]].mm(A[[j]]) * inv_eye)/(1-A[:,j]*A[j])
+            A_update = A[:,[j]].mm(A[[j]])
+            A_update[range(A.shape[0]), range(A.shape[0])] = 0            
+            A_update /= (1-A[:,j]*A[j])
+
+            A += A_update
             A = A[bJ][:,bJ]
 
             if ji > 0 and (ji+1) % weight_block_size == 0:
@@ -258,20 +265,20 @@ class ModelWrapper2(ModelWrapper):
                 W_ = W
                 A_ = A
 
-            if not torch.isfinite(A).any():
-                print('A =',A)
-                exit(0)
+            # if not torch.isfinite(A).any():
+            #     print('A =',A)
+            #     exit(0)
 
-            if not torch.isfinite(W).any():
-                print(ji, 'Aj = ', (1-A[:,j]*A[j]).max(), (1-A[:,j]*A[j]).min())
-                print(ji, 'W =',W)
-                exit(0)
+            # if not torch.isfinite(W).any():
+            #     print(ji, 'Aj = ', (1-A[:,j]*A[j]).max(), (1-A[:,j]*A[j]).min())
+            #     print(ji, 'W =',W)
+            #     exit(0)
             
             w_norm = torch.norm(W,dim=1).mean()            
             # W, A = W_, A_
         print('change in weight norm: %.4f -> %.4f' % (init_w_norm, w_norm))        
         return W_, A_.detach().cpu()
-
+    
     def remove_input_neurons(self, layer_idx, neuron_idxs, A=None, mean_Z=None, weight_block_size=1):
         outsize, insize = utils.get_layer_input_output_size(self.layers[layer_idx])            
         retain_idxs = [i for i in range(insize) if i not in neuron_idxs]
@@ -282,9 +289,24 @@ class ModelWrapper2(ModelWrapper):
         b = layer.bias.data
         if isinstance(layer, nn.Linear):
             if A is not None:
-                W = torch.cat((W, b.view(-1,1)), dim=1)
-                W, A = self.adjust_weights(W, A, neuron_idxs, mean_Z, weight_block_size)
-                W, b = W[:,:-1], W[:,-1]
+                if weight_block_size > 1:
+                    h = w = int(np.sqrt(weight_block_size))
+                    W = W.view(W.shape[0], -1, h, w)                    
+                    b_ = b / (W.shape[2] * W.shape[3])
+                    b_ = b_.view(-1,1,1,1)
+                    b_ = b_.expand(-1,-1,W.shape[2], W.shape[3])
+                    
+                    W = torch.cat((W, b_), dim=1)                    
+                    W, A = self.adjust_weights(W, A, neuron_idxs, mean_Z)
+                    W, b = W[:,:-1], W[:,-1]
+                    
+                    b = b[:,0,0]
+                    W = W.view(W.shape[0], -1)                    
+                else:
+                    W = torch.cat((W, b.view(-1,1)), dim=1)
+                    W, A = self.adjust_weights(W, A, neuron_idxs, mean_Z, weight_block_size)
+                    W, b = W[:,:-1], W[:,-1]
+                    b = b.view(-1)
             else:
                 W = W[:, retain_idxs]
             new_layer = nn.Linear(W.shape[1], outsize)
@@ -293,9 +315,14 @@ class ModelWrapper2(ModelWrapper):
         elif isinstance(layer, nn.BatchNorm2d):
             W = W[retain_idxs]
             b = layer.bias[retain_idxs]
+            running_mean = layer.running_mean[retain_idxs]
+            running_var = layer.running_var[retain_idxs]
+
             new_layer = nn.BatchNorm2d(W.shape[0])
             new_layer.weight.data = W
             new_layer.bias.data = b
+            new_layer.running_mean = running_mean
+            new_layer.running_var = running_var
         elif isinstance(layer, nn.Conv2d):            
             if A is not None:
                 b_ = b / (W.shape[2] * W.shape[3])
@@ -363,8 +390,11 @@ class ModelWrapper2(ModelWrapper):
         new_size = int(outsize*factor - difference)
         if self.args.readjust_weights:            
             A, salience_scores, mean_Z = self.compute_prune_probability(i, data)
-            if self.is_last_conv(i):
-                A2, _, mean_Z2 = self.compute_prune_probability(i, data, flatten_conv_map=True)
+            # if self.is_last_conv(i):
+            #     del A
+            #     torch.cuda.ipc_collect()
+            #     A, _, mean_Z = self.compute_prune_probability(i, data, flatten_conv_map=True)
+            #     torch.cuda.ipc_collect()
         else:
             _, salience_scores, _ = self.compute_prune_probability(i, data)
 
@@ -389,40 +419,54 @@ class ModelWrapper2(ModelWrapper):
         pruned_neurons = sorted(pruned_neurons)
         
         k = i+1
-        while k < len(self.layers):            
-            if utils.is_input_modifiable(self.layers[k]):
-                _, old_insize = utils.get_layer_input_output_size(self.layers[k])
-                nrepeats = old_insize // outsize
-                
-                if self.is_last_conv(i):
-                    num_last_conv_filts = self.layers[i].weight.data.shape[0]            
-                    idxs = np.arange(old_insize).reshape(num_last_conv_filts, -1)
-                    pruned_input_neurons_ = pruned_input_neurons = idxs[pruned_neurons].flatten()                    
-                else:
-                    pruned_input_neurons_ = pruned_input_neurons = pruned_neurons
-                
-                if isinstance(self.layers[k], nn.BatchNorm2d):
-                    pruned_input_neurons = pruned_neurons
-
-                init_w_norm = torch.norm(self.layers[k].weight.data, dim=-1).mean()
-                if self.args.readjust_weights:
-                    if self.is_last_conv(i):
-                        self.layers[k], updated_A2 = self.remove_input_neurons(k, pruned_input_neurons, A2, mean_Z2, nrepeats)
-                        # self.shrinking_state['A2'] = updated_A2
-                    else:
-                        self.layers[k], updated_A1 = self.remove_input_neurons(k, pruned_input_neurons, A, mean_Z)
-                        # self.shrinking_state['A1'] = updated_A1
-                        # print(updated_A1.shape)                      
-                else:
-                    self.layers[k], _ = self.remove_input_neurons(k, pruned_input_neurons)
-                pruned_input_neurons = pruned_input_neurons_
-
-                w_norm = torch.norm(self.layers[k].weight.data, dim=-1).mean()
-                print('change in weight norm: %.4f -> %.4f' % (init_w_norm, w_norm))
-
-                if not isinstance(self.layers[k], nn.BatchNorm2d):
-                    break
+        while k < len(self.layers) and not utils.is_weighted(self.layers[k]):
             k += 1
+        # if utils.is_input_modifiable(self.layers[k]) and not isinstance(self.layers[k], nn.BatchNorm2d):
+        _, old_insize = utils.get_layer_input_output_size(self.layers[k])
+        nrepeats = old_insize // outsize
+        
+        # if self.is_last_conv(i):
+        #     num_last_conv_filts = self.layers[i].weight.data.shape[0]            
+        #     idxs = np.arange(old_insize).reshape(num_last_conv_filts, -1)
+        #     pruned_input_neurons_ = pruned_input_neurons = idxs[pruned_neurons].flatten()
+        # else:
+        pruned_input_neurons_ = pruned_input_neurons = pruned_neurons
+        
+        if isinstance(self.layers[k], nn.BatchNorm2d):
+            pruned_input_neurons = pruned_neurons
+
+        init_w_norm = torch.norm(self.layers[k].weight.data, dim=-1).mean()
+        if self.args.readjust_weights:
+            if self.is_last_conv(i):
+                # A2 = torch.repeat_interleave(A, repeats=nrepeats, dim=0)
+                # A2 = torch.repeat_interleave(A2, repeats=nrepeats, dim=1)[:-nrepeats+1, :-nrepeats+1]
+                # mean_Z2 = np.repeat(mean_Z, nrepeats) // nrepeats
+                self.layers[k], _ = self.remove_input_neurons(k, pruned_input_neurons, A, mean_Z, nrepeats)
+                # self.shrinking_state['A2'] = updated_A2
+                torch.cuda.ipc_collect()
+            else:
+                self.layers[k], _ = self.remove_input_neurons(k, pruned_input_neurons, A, mean_Z)
+                # self.shrinking_state['A1'] = updated_A1
+                # print(updated_A1.shape)                      
+        else:
+            if self.is_last_conv(i):
+                num_last_conv_filts = self.layers[i].weight.data.shape[0]            
+                idxs = np.arange(old_insize).reshape(num_last_conv_filts, -1)
+                pruned_input_neurons_ = pruned_input_neurons = idxs[pruned_neurons].flatten()
+            self.layers[k], _ = self.remove_input_neurons(k, pruned_input_neurons)
+        pruned_input_neurons = pruned_input_neurons_
+
+        w_norm = torch.norm(self.layers[k].weight.data, dim=-1).mean()
+        print('change in weight norm: %.4f -> %.4f' % (init_w_norm, w_norm))
+
+                # if not isinstance(self.layers[k], nn.BatchNorm2d):
+                #     break
+            # k += 1
+        
+        bn_idx = i+1
+        while bn_idx < len(self.layers) and not isinstance(self.layers[bn_idx], nn.BatchNorm2d):
+            bn_idx += 1        
+
         _, new_insize = utils.get_layer_input_output_size(self.layers[k])
         
         if self.args.readjust_weights:
@@ -432,8 +476,15 @@ class ModelWrapper2(ModelWrapper):
             else:
                 num_removed_neurons = old_insize-new_insize            
             self.layers[i] = self.remove_output_neurons(i, pruned_neurons[:num_removed_neurons])
+            
+            if bn_idx < len(self.layers) and isinstance(self.layers[bn_idx], nn.BatchNorm2d):
+                self.layers[bn_idx], _ = self.remove_input_neurons(bn_idx, pruned_neurons[:num_removed_neurons])
         else:
-            self.layers[i] = self.remove_output_neurons(i, pruned_neurons)            
+            self.layers[i] = self.remove_output_neurons(i, pruned_neurons)
+            
+            if bn_idx < len(self.layers) and isinstance(self.layers[bn_idx], nn.BatchNorm2d):
+                self.layers[bn_idx], _ = self.remove_input_neurons(bn_idx, pruned_neurons)
+
         new_outsize, insize = utils.get_layer_input_output_size(self.layers[i])
         return new_outsize < outsize
 
@@ -763,7 +814,7 @@ def alexnet(num_classes, pretrained=False, feature_extraction=False, classifier_
         param.requires_grad = True
     return m
 
-def alexnetCIFAR(num_classes, pretrained=False, feature_extraction=False, **kwargs):
+def alexnetCIFAR(num_classes, pretrained=False, feature_extraction=False, classifier_depth=1, **kwargs):
     return AlexNetCIFAR(num_classes)
 
 def papernot(num_classes, pretrained=False, feature_extraction=False, **kwargs):

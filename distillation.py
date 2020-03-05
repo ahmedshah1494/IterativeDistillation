@@ -232,8 +232,16 @@ def iterative_distillation(student_model:StudentModelWrapper, bottleneck_layer_i
     gpu_mem = torch.cuda.memory_allocated(args.device)
     
     bottleneck_size,_ = utils.get_layer_input_output_size(student_model.layers[bottleneck_layer_idx])
-    
+    # if student_model.is_last_conv(bottleneck_layer_idx):
+    #     i = bottleneck_layer_idx+1
+    #     while i < len(student_model.layers) and not utils.is_weighted(student_model.layers[i]) and not isinstance(student_model.layers[i], nn.Dropout):
+    #         i += 1
+    #     _, output_size = utils.get_layer_input_output_size(student_model.layers[i])
+    #     print(output_size, output_size//bottleneck_size)
+    #     batch_idx = np.random.permutation(np.arange(len(train_dataset)))[:max(output_size, args.salience_check_samples)]
+    # else:
     batch_idx = np.random.permutation(np.arange(len(train_dataset)))[:max(bottleneck_size, args.salience_check_samples)]
+    
     batch = [train_dataset[i] for i in batch_idx]
     batch = [x[0] for x in batch]
     batch_loader = DataLoader(batch, args.batch_size)
@@ -333,6 +341,21 @@ def simple_distillation(teacher_model: models.ModelWrapper, student_model, train
 
     distill(student_model,train_loader,val_loader,base_metric, args) 
 
+def fine_tune(student_model, train_loader, val_loader):
+    loss_w = args.loss_weight            
+    args.loss_weight = 1
+
+    nepochs = args.nepochs
+    args.nepochs = args.n_fine_tune_epochs        
+
+    metric = distill(student_model, train_loader, val_loader, 1.0, args, utils.compute_correct, logger)
+
+    args.loss_weight = loss_w
+    args.nepochs = nepochs
+    
+    torch.cuda.ipc_collect()
+    return metric
+
 def main(args):
     train_dataset, test_dataset, nclasses = utils.get_datasets(args)
     new_test_size = int(0.8*len(test_dataset))
@@ -362,10 +385,13 @@ def main(args):
 
     student_model.args = args
     student_model = student_model.to(args.device)
-    student_base_metric = evaluate(student_model, val_dataset, args)    
-    
-    
+    student_base_metric = evaluate(student_model, val_dataset, args)
+
     if args.test_only:
+        print('teacher_base_metric = %.4f' % (teacher_base_metric))
+        # logger.info('base_metric = %.4f' % (teacher_base_metric))
+        print('student_base_metric = %.4f' % (student_base_metric))
+        # logger.info('student_base_metric = %.4f' % student_base_metric)
         return teacher_base_metric, student_base_metric
 
     base_metric = max(args.base_metric, teacher_base_metric)
@@ -401,7 +427,10 @@ def main(args):
                 not_shrinkables = args.exclude_layers[:]
             
             if rri == 0 and args.start_layer_idx >= 0 and args.start_layer_idx in shrinkable_layers:
-                not_shrinkables += [i for i in shrinkable_layers if i > args.start_layer_idx]
+                if args.reverse_shrink_order:
+                    not_shrinkables += [i for i in shrinkable_layers if i > args.start_layer_idx]
+                else:
+                    not_shrinkables += [i for i in shrinkable_layers if i < args.start_layer_idx]
                 shrinkable_layers = shrinkable_layers[shrinkable_layers.index(args.start_layer_idx):]                        
                     
             print(rri, not_shrinkables, shrinkable_layers, args.exclude_layers, args.shrink_layer_idxs)            
@@ -433,21 +462,6 @@ def main(args):
             
     else:
         student_model = iterative_distillation(student_model, shrinkable_layers[-1], train_logits, val_dataset, test_dataset, nclasses, base_metric, args, mLogger=logger)
-
-    def fine_tune():
-        loss_w = args.loss_weight            
-        args.loss_weight = 1
-
-        nepochs = args.nepochs
-        args.nepochs = args.n_fine_tune_epochs        
-
-        metric = distill(student_model, train_loader, val_loader, base_metric, args, val_metric_fn, logger)
-
-        args.loss_weight = loss_w
-        args.nepochs = nepochs
-        
-        torch.cuda.ipc_collect()
-        return metric
 
     print(student_model)
     test_metric = evaluate(student_model, test_dataset, args)
@@ -482,6 +496,7 @@ if __name__ == '__main__':
     parser.add_argument('--retain_teacher_weights', action='store_true')
     parser.add_argument('--shrink_all', action='store_true')
     parser.add_argument('--fine_tune', action='store_true')
+    parser.add_argument('--fine_tune_only', action='store_true')
     parser.add_argument('--reverse_shrink_order', action='store_true')
     parser.add_argument('--round_robin', action='store_true')
     parser.add_argument('--round_robin_iters', type=int, default=10)
