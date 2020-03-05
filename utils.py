@@ -140,10 +140,11 @@ def reinitialize_model(model):
 modifiable_output = [nn.Linear, nn.Conv2d]
 weighted_layers = [nn.Linear, nn.Conv2d]
 modifiable_input = [nn.Linear, nn.Conv2d, nn.BatchNorm2d]
+activations = [nn.ReLU]
 is_output_modifiable = lambda l: 1 in [int(isinstance(l,t)) for t in modifiable_output]
 is_weighted = lambda l: 1 in [int(isinstance(l,t)) for t in weighted_layers]
 is_input_modifiable = lambda l: 1 in [int(isinstance(l,t)) for t in modifiable_input]
-
+is_activation = lambda l: 1 in [int(isinstance(l,t)) for t in activations]
 def change_layer_output(layer, new_size=None, factor=1, difference=0):    
     if isinstance(layer, nn.Linear):
         outsize, insize = layer.weight.shape
@@ -274,17 +275,18 @@ def get_datasets(args):
         
     elif args.dataset == 'tiny_imagenet':
         train_transform = transforms.Compose([
-            transforms.Resize(size=224),
-            # transforms.RandomRotation(degrees=15),
-            # transforms.ColorJitter(),
-            # transforms.RandomHorizontalFlip(),
+            transforms.Resize(224),
+            # transforms.RandomResizedCrop(size=224, scale=(0.8, 1.0)),
+            transforms.RandomRotation(degrees=15),
+            transforms.ColorJitter(),
+            transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
             transforms.Normalize([0.485, 0.456, 0.406],
                                 [0.229, 0.224, 0.225])  # Imagenet standards
         ])
 
         test_transform = transforms.Compose([
-            transforms.Resize(size=224),
+            transforms.Resize(224),
             transforms.ToTensor(),
             transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
         ])
