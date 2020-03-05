@@ -9,19 +9,33 @@ import json
 from datetime import datetime
 
 def get_expt_info(logfn):
+    info = {k:None for k in ['datetime', 'ns', 'test_metric', 'val_metric', 'base_metric']}
     with open(logfn) as f:
         txt = f.readlines()
         if 'test_metric' not in txt[-1]:
             return None
 
         for i in range(len(txt)-1,-1, -1):
-            if "Namespace" in txt[i]:
+            line = txt[i]
+            if "Namespace" in line:
                 split = txt[i].split()
                 date = split[0]
                 time = split[1]
                 ns_idx = txt[i].index('Namespace')                
                 ns = eval(txt[i][ns_idx:])
-                return {'datetime': "%s %s" % (date,time), 'ns':ns}
+
+                info['datetime'] = "%s %s" % (date,time)
+                info['ns'] = ns
+                break
+
+            elif 'test_metric' in line and  info['test_metric'] is None:
+                info['test_metric'] = float(line.split('=')[-1])
+            elif 'val_metric' in line and info['val_metric'] is None:
+                info['val_metric'] = float(line.split(':')[-1])
+            elif 'base_metric' in line and  info['base_metric'] is None:
+                info['base_metric'] = float(line.split('=')[-1])
+
+        return info
 
 def get_num_params(model_path):
     model = torch.load(model_path)
@@ -66,27 +80,27 @@ for lf in log_files:
             ns.device = torch.device('cpu')        
 
         if os.path.exists(ns.teacher_model_file) and os.path.exists(ns.student_model_file):
-            base_metric, metric = test(ns)
+            # base_metric, metric = test(ns)
             teacher_params = get_num_params(ns.teacher_model_file)
             student_params = get_num_params(ns.student_model_file)
         else:
             continue
         reduction = {k: 1 - student_params[k]/teacher_params[k] for k in teacher_params}
 
-        results.append({
+        expt_info.update({
             'model_name': lf.split('/')[-1].split('.')[0],
             'datetime': expt_info['datetime'],
-            'base_accuracy': base_metric,
-            'accuracy': metric,
             'teacher_num_params':teacher_params,
             'student_num_params':student_params,
             'reduction': reduction,
             'args': arg_dict
         })
+        expt_info.pop('ns')
+        results.append(expt_info)
         # if len(results) == 3:
         #     break
     torch.cuda.ipc_collect()
-results = sorted(results, key=lambda x: x['datetime'], reverse=True)
+results = sorted(results, key=lambda x: x['model_name'], reverse=True)
 
 now = datetime.now()
 dt = now.strftime("%m%d%Y")
