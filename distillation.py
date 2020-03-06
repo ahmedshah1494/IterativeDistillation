@@ -13,6 +13,7 @@ from tqdm import tqdm,trange
 from multiprocessing import cpu_count
 from copy import deepcopy
 import os
+import pickle
 
 class StudentModelWrapper(nn.Module, models.ModelWrapper):
     def __init__(self, model, logger, args):
@@ -117,6 +118,7 @@ def get_logits(model, dataset, args):
     X = torch.cat(X, 0)
     Y = torch.cat(Y, 0)
     Z = torch.cat(Z, 0)
+
     print(X.shape, Y.shape, Z.shape)
     logits = torch.utils.data.TensorDataset(X,Y,Z)
     return logits
@@ -221,7 +223,18 @@ def iterative_distillation(student_model:StudentModelWrapper, bottleneck_layer_i
         torch.cuda.ipc_collect()
         return metric
 
-    print(student_model) 
+    print(student_model)
+
+    if args.tune_current_layer_only:
+        for li, l in enumerate(student_model.layers):
+            if li != bottleneck_layer_idx:
+                for p in l.parameters():
+                    p.requires_grad = False 
+
+    if args.store_Ys:
+        Ys = []
+        y = student_model.get_Y(val_loader, bottleneck_layer_idx)
+        Ys.append(y)
     
     torch.save(student_model, args.outfile)
     student_model = student_model.to(args.device)
@@ -259,6 +272,7 @@ def iterative_distillation(student_model:StudentModelWrapper, bottleneck_layer_i
     print(student_model, bottleneck_size)   
     delta = 0
     break_next_iter = False
+    tuned = False 
     while (bottleneck_size > 0):
         metric = evaluate(student_model, val_dataset, args, val_metric_fn)
         print('val_metric:', metric)
@@ -269,15 +283,26 @@ def iterative_distillation(student_model:StudentModelWrapper, bottleneck_layer_i
         print('bottleneck_size = %d' % bottleneck_size)
         logger.info('bottleneck_size = %d' % bottleneck_size)
         
-        if delta < args.tol:                    
+        if delta < args.tol:
+            tuned = True            
             gpu_mem = torch.cuda.memory_allocated(args.device)
             metric = distill(student_model, train_loader, val_loader, base_metric, args, val_metric_fn, mLogger)
             torch.cuda.ipc_collect()
             
             print('\nchange in mem after distillation:%d\t%d\n' % (torch.cuda.memory_allocated(args.device) - gpu_mem, torch.cuda.memory_allocated()))
             logger.info('current metric = %.4f base_metric = %.4f' % (metric, base_metric))
-
         delta = metric - base_metric
+
+        if args.store_Ys:
+            if len(Ys) < args.store_Y_iters:
+                y = student_model.get_Y(val_loader, bottleneck_layer_idx)
+                Ys.append((y, tuned))
+                tuned = False                
+                with open(args.Y_outfile, 'wb') as f:
+                    pickle.dump(Ys, f)
+            if len(Ys) == args.store_Y_iters:                
+                return student_model
+
         if args.fine_tune and delta < args.tol:
             metric = fine_tune()
         delta = metric - base_metric
@@ -366,7 +391,7 @@ def main(args):
     teacher_model = teacher_model.eval()
     
     teacher_base_metric = evaluate(teacher_model, val_dataset, args)
-    
+    teacher_test_metric = evaluate(teacher_model, test_dataset, args)
     if not args.test_only:
         train_logits = get_logits(teacher_model, train_dataset, args)
         teacher_model = teacher_model.cpu()
@@ -388,11 +413,13 @@ def main(args):
     student_base_metric = evaluate(student_model, val_dataset, args)
 
     if args.test_only:
+        student_test_metric = evaluate(student_model, test_dataset, args)
+        print('teacher_test_metric = %.4f' % (teacher_test_metric))
         print('teacher_base_metric = %.4f' % (teacher_base_metric))
         # logger.info('base_metric = %.4f' % (teacher_base_metric))
         print('student_base_metric = %.4f' % (student_base_metric))
         # logger.info('student_base_metric = %.4f' % student_base_metric)
-        return teacher_base_metric, student_base_metric
+        return teacher_base_metric, student_base_metric, teacher_test_metric, student_test_metric
 
     base_metric = max(args.base_metric, teacher_base_metric)
     
@@ -461,12 +488,14 @@ def main(args):
             rri += 1
             
     else:
-        student_model = iterative_distillation(student_model, shrinkable_layers[-1], train_logits, val_dataset, test_dataset, nclasses, base_metric, args, mLogger=logger)
+        student_model = iterative_distillation(student_model, shrinkable_layers[args.start_layer_idx], train_logits, val_dataset, test_dataset, nclasses, base_metric, args, mLogger=logger)
 
     print(student_model)
     test_metric = evaluate(student_model, test_dataset, args)
     print('test_metric = %.4f' % (test_metric))
+    print('teacher_test_metric = %.4f' % (teacher_test_metric))
     logger.info('test_metric = %.4f' % (test_metric))
+    logger.info('teacher_test_metric = %.4f' % (teacher_test_metric))
     torch.save(student_model, args.outfile)
 
 if __name__ == '__main__':
@@ -510,6 +539,10 @@ if __name__ == '__main__':
     parser.add_argument('--predictive_pruning_iters', type=int, default=1000)
     parser.add_argument('--predictive_pruning_batch_size', type=int, default=128)
     parser.add_argument('--predictive_pruning_lr', type=float, default=1e-3)
+    parser.add_argument('--tune_current_layer_only', action='store_true')
+    parser.add_argument('--store_Ys', action='store_true')
+    parser.add_argument('--store_Y_iters', type=int, default=3)
+    parser.add_argument('--Y_outfile', type=str, default='')
     parser.add_argument('--readjust_weights', action='store_true')
     parser.add_argument('--test_only', action='store_true')
     args = parser.parse_args()
