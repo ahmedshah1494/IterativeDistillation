@@ -18,6 +18,25 @@ class ModelWrapper(object):
     
     def reset(self):
         pass
+
+    def get_Y(self, data, i):
+        i += 1
+        while i < len(self.layers) and not utils.is_weighted(self.layers[i]):
+            i += 1
+        trunc_model = self.layers[:i+1]
+        trunc_model = trunc_model.eval()
+
+        print(trunc_model)
+
+        Ys = []
+        for batch in data:
+            x = batch[0]
+            x = x.to(self.device)
+            Y = trunc_model(x)
+            Ys.append(Y.detach().cpu())
+        Y = torch.cat(Ys,dim=0).numpy()
+
+        return Y
     
     def get_shrinkable_layers(self, non_shrinkables=[]):
         shrinkable_layers = [i for i,l in enumerate(self.layers[:-1]) if utils.is_output_modifiable(l) and i not in non_shrinkables]
@@ -100,7 +119,7 @@ class ModelWrapper2(ModelWrapper):
     #         'layer_idx': layer_idx,
     #         'A1': A1,
     #         'A2': A2
-    #     }
+    #     }    
 
     def score_neurons(self, Z, init_A = None):
         size = Z.shape[1]
