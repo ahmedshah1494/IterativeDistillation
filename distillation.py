@@ -132,12 +132,15 @@ def distill(student_model, train_loader, val_loader, base_metric, args, val_metr
     else:
         raise ValueError('optimizer should be either "adam" or "sgd"')
 
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', patience=args.patience, factor=0.5, min_lr=1e-6)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', patience=args.patience, factor=0.5)
 
     best_model = None
     t = range(args.nepochs)
     T = args.T
     loss_w = args.loss_weight
+
+    best_acc = 0
+    epochs_since_best = 0
     for i in t:
         epoch_loss = 0
         epoch_soft_loss = 0
@@ -180,7 +183,15 @@ def distill(student_model, train_loader, val_loader, base_metric, args, val_metr
         old_lr = optimizer.param_groups[0]['lr']
         scheduler.step(val_acc)
 
-        if optimizer.param_groups[0]['lr'] <= 1e-6:
+        if val_acc - best_acc > 1e-5:
+            best_acc = val_acc
+            epochs_since_best = 0
+        else:
+            epochs_since_best += 1
+            if epochs_since_best > 3*args.patience and args.early_stop:
+                break
+
+        if optimizer.param_groups[0]['lr'] <= 1e-7 and args.early_stop:
             break
         
         if args.increase_loss_weight:
@@ -262,6 +273,7 @@ def iterative_distillation(student_model:StudentModelWrapper, bottleneck_layer_i
     torch.cuda.ipc_collect()
 
     if not student_model.shrink_layer(bottleneck_layer_idx, batch_loader, factor=args.shrink_factor):
+        print('returning...')
         return student_model
         
     torch.cuda.ipc_collect()
@@ -334,6 +346,7 @@ def iterative_distillation(student_model:StudentModelWrapper, bottleneck_layer_i
         print('\nchange in mem after shrinking:%d\t%d\n' % (torch.cuda.memory_allocated(args.device) - gpu_mem, torch.cuda.memory_allocated()))
 
         new_bottleneck_size,_ = utils.get_layer_input_output_size(student_model.layers[bottleneck_layer_idx])
+        print('new_bottleneck_size:', new_bottleneck_size)
         if new_bottleneck_size == bottleneck_size:
             break
         else:
@@ -353,7 +366,10 @@ def iterative_distillation(student_model:StudentModelWrapper, bottleneck_layer_i
         torch.save(student_model, args.outfile)
     del student_model
     
-    student_model = torch.load(args.outfile).to(args.device)    
+    student_model = torch.load(args.outfile).to(args.device)
+    val_metric = evaluate(student_model, val_dataset, args, val_metric_fn)
+    print('val_metric:', val_metric)
+    logger.info('val_metric:%f'%val_metric)
     return student_model
 
 def simple_distillation(teacher_model: models.ModelWrapper, student_model, train_dataset, val_dataset, nclasses, args):
@@ -382,7 +398,7 @@ def fine_tune(student_model, train_loader, val_loader):
     return metric
 
 def main(args):
-    train_dataset, test_dataset, nclasses = utils.get_datasets(args)
+    train_dataset, test_dataset, nclasses = utils.get_datasets(args, not args.no_normalization)
     new_test_size = int(0.8*len(test_dataset))
     val_size = len(test_dataset) - new_test_size
     test_dataset, val_dataset = random_split(test_dataset, [new_test_size, val_size])
@@ -545,6 +561,9 @@ if __name__ == '__main__':
     parser.add_argument('--Y_outfile', type=str, default='')
     parser.add_argument('--readjust_weights', action='store_true')
     parser.add_argument('--test_only', action='store_true')
+    parser.add_argument('--early_stop', action='store_true')
+    parser.add_argument('--no_normalization', action='store_true')
+    parser.add_argument('--scale_by_grad', action='store_true')
     args = parser.parse_args()
 
     np.random.seed(1494)
