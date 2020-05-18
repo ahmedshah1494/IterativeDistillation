@@ -8,6 +8,42 @@ import utils
 import types
 import time
 import sys
+from wide_resnet import Wide_ResNet
+
+class WideResNetEncoder(nn.Module):
+    def __init__(self, ):
+        super(WideResNetEncoder, self).__init__()
+        self.encoder = Wide_ResNet(28, 10, 0.3, 10)    
+        delattr(self.encoder, 'linear')
+        
+    def forward(self, x):
+        out = self.encoder.conv1(x)
+        out = self.encoder.layer1(out)
+        out = self.encoder.layer2(out)
+        out = self.encoder.layer3(out)
+        out = torch.relu(self.encoder.bn1(out))
+        out = nn.functional.avg_pool2d(out, 8)
+        return out
+
+class CIFAR10Classifier(nn.Module):
+    def __init__(self, model_name):
+        super(CIFAR10Classifier, self).__init__()
+
+        fe_dict = {            
+            'wide_resnet': lambda: WideResNetEncoder()
+        }
+        self.name = model_name+"Classifier"
+        self.fe = fe_dict[model_name]()
+        sample_output = self.fe(torch.rand((2,3,32,32)))
+        sample_output = sample_output.view(sample_output.shape[0], -1)        
+        self.classifier = nn.Linear(sample_output.shape[1], 10)
+    
+    def forward(self, x):
+        x = utils.normalize_image_tensor(x)
+        f = self.fe(x)
+        f = f.view(f.shape[0], -1)
+        logits = self.classifier(f)
+        return logits
 
 class ModelWrapper(object):
     def __init__(self):
@@ -184,6 +220,27 @@ class ModelWrapper2(ModelWrapper):
         scores = -1 * avg_error
         return A, scores
     
+    def compute_neuron_derivatives(self, Z, model):
+        dataset = TensorDataset(Z)
+        loader = DataLoader(Z, batch_size=1, shuffle=True)
+
+        z_grad = np.zeros((Z.shape[1],))
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.)
+        for bi,z in enumerate(loader):
+            z = z.cuda()
+            z.requires_grad = True
+            optimizer.zero_grad()
+            logits = model(z)
+            logits.backward(torch.ones(logits.shape).to(z.device))
+            _z_grad = z.grad
+            _z_grad = _z_grad.squeeze(0).view(z.shape[1],-1).sum(1).detach().cpu().numpy()
+            z_grad += _z_grad
+        z_grad = np.abs(z_grad)
+        z_grad /= z_grad.sum()
+        print(z_grad, z_grad.shape)
+        print(z_grad.max(), z_grad.min())
+        return z_grad
+        
     def compute_prune_probability(self, i, data, flatten_conv_map=False, init_A1=None, init_A2=None):        
         k = i
         while i+1 < len(self.layers) and not utils.is_weighted(self.layers[i+1]) and not isinstance(self.layers[i+1], Flatten) and not isinstance(self.layers[i+1], nn.Dropout):
@@ -201,6 +258,11 @@ class ModelWrapper2(ModelWrapper):
             Zs.append(Z.detach().cpu())
         Z = torch.cat(Zs,dim=0)
 
+        if self.args.scale_by_grad:
+            scale = self.compute_neuron_derivatives(Z, self.layers[i+1:])
+        else:
+            scale = 1
+
         Z = Z.permute([j for j in range(len(Z.shape)) if j != 1]+[1])
         if flatten_conv_map:
             Z = Z.contiguous().view(Z.shape[0], -1)
@@ -212,8 +274,9 @@ class ModelWrapper2(ModelWrapper):
         ones = torch.ones((Z.shape[0],1), device=Z.device)
         Z = torch.cat((Z,ones), dim=1)
         print('Z.shape =', Z.shape)
-        A, scores = self.score_neurons(Z, init_A=init_A)
+        A, scores = self.score_neurons(Z, init_A=init_A)        
         scores = scores[:-1]
+        scores = scores*scale
 
         Z = Z.detach().cpu().numpy()
         torch.cuda.ipc_collect()
@@ -264,8 +327,6 @@ class ModelWrapper2(ModelWrapper):
                 W = W.permute(reverse_permutation_order)
 
             W = W[:,bJ]            
-
-            
             print('future error: %.4f' % future_error)
             # if (ji+1) % weight_block_size == weight_block_size-1 and future_error > 1.0:
             #     break
@@ -279,7 +340,7 @@ class ModelWrapper2(ModelWrapper):
             A += A_update
             A = A[bJ][:,bJ]
 
-            if ji > 0 and (ji+1) % weight_block_size == 0:
+            if weight_block_size == 1 or (ji > 0 and (ji+1) % weight_block_size == 0):
                 print('caching W and A...')
                 W_ = W
                 A_ = A
@@ -295,7 +356,8 @@ class ModelWrapper2(ModelWrapper):
             
             w_norm = torch.norm(W,dim=1).mean()            
             # W, A = W_, A_
-        print('change in weight norm: %.4f -> %.4f' % (init_w_norm, w_norm))        
+        print('change in weight norm: %.4f -> %.4f' % (init_w_norm, w_norm))
+        print(W_.shape)
         return W_, A_.detach().cpu()
     
     def remove_input_neurons(self, layer_idx, neuron_idxs, A=None, mean_Z=None, weight_block_size=1):
@@ -476,7 +538,7 @@ class ModelWrapper2(ModelWrapper):
         pruned_input_neurons = pruned_input_neurons_
 
         w_norm = torch.norm(self.layers[k].weight.data, dim=-1).mean()
-        print('change in weight norm: %.4f -> %.4f' % (init_w_norm, w_norm))
+        print('change in weight norm: %.4f -> %.4f' % (init_w_norm, w_norm))        
 
                 # if not isinstance(self.layers[k], nn.BatchNorm2d):
                 #     break
@@ -487,6 +549,7 @@ class ModelWrapper2(ModelWrapper):
             bn_idx += 1        
 
         _, new_insize = utils.get_layer_input_output_size(self.layers[k])
+        print(self.layers[k].weight.data.shape, old_insize, new_insize)
         
         if self.args.readjust_weights:
             if self.is_last_conv(i):
@@ -495,7 +558,7 @@ class ModelWrapper2(ModelWrapper):
             else:
                 num_removed_neurons = old_insize-new_insize            
             self.layers[i] = self.remove_output_neurons(i, pruned_neurons[:num_removed_neurons])
-            
+            print('layer[i].shape:',self.layers[i].weight.shape)
             if bn_idx < len(self.layers) and isinstance(self.layers[bn_idx], nn.BatchNorm2d):
                 self.layers[bn_idx], _ = self.remove_input_neurons(bn_idx, pruned_neurons[:num_removed_neurons])
         else:
