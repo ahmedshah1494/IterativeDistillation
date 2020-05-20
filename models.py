@@ -220,25 +220,31 @@ class ModelWrapper2(ModelWrapper):
         scores = -1 * avg_error
         return A, scores
     
-    def compute_neuron_derivatives(self, Z, model):
-        dataset = TensorDataset(Z)
-        loader = DataLoader(Z, batch_size=1, shuffle=True)
+    def compute_neuron_derivatives(self, Z, Y, model):
+        dataset = TensorDataset(Z, Y)
+        loader = DataLoader(dataset, batch_size=1, shuffle=False)
 
         z_grad = np.zeros((Z.shape[1],))
         optimizer = torch.optim.SGD(model.parameters(), lr=0.)
-        for bi,z in enumerate(loader):
-            z = z.cuda()
+        criterion = nn.CrossEntropyLoss()
+        for bi,(z,y) in enumerate(loader):            
+            z = z.to(self.device)
             z.requires_grad = True
             optimizer.zero_grad()
             logits = model(z)
-            logits.backward(torch.ones(logits.shape).to(z.device))
+            if self.args.scale_by_grad == 'output':
+                logits.backward(torch.ones(logits.shape).to(z.device))                
+            else:
+                y = y.to(self.device)
+                loss = criterion(logits, y)
+                loss.backward()
             _z_grad = z.grad
-            _z_grad = _z_grad.squeeze(0).view(z.shape[1],-1).sum(1).detach().cpu().numpy()
+            _z_grad = _z_grad.squeeze(0).view(z.shape[1],-1).sum(1).detach().cpu().numpy()            
             z_grad += _z_grad
         z_grad = np.abs(z_grad)
         z_grad /= z_grad.sum()
-        print(z_grad, z_grad.shape)
-        print(z_grad.max(), z_grad.min())
+        print(z_grad.shape)
+        print(z_grad.max(), z_grad.mean(), z_grad.min())
         return z_grad
         
     def compute_prune_probability(self, i, data, flatten_conv_map=False, init_A1=None, init_A2=None):        
@@ -252,14 +258,17 @@ class ModelWrapper2(ModelWrapper):
         print(self.layers[k:i+1])
         print('------------------------------------------------------------')
         Zs = []
-        for batch in data:
-            batch = batch.to(self.device)
-            Z = trunc_model(batch)
+        Ys = []
+        for x,y,_ in data:
+            x = x.to(self.device)
+            Z = trunc_model(x)
             Zs.append(Z.detach().cpu())
+            Ys.append(y.detach().cpu())
         Z = torch.cat(Zs,dim=0)
+        Y = torch.cat(Ys,dim=0)
 
-        if self.args.scale_by_grad:
-            scale = self.compute_neuron_derivatives(Z, self.layers[i+1:])
+        if self.args.scale_by_grad != 'none':
+            scale = self.compute_neuron_derivatives(Z, Y, self.layers[i+1:])
         else:
             scale = 1
 
