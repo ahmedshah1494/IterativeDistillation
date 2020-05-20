@@ -267,7 +267,7 @@ def iterative_distillation(student_model:StudentModelWrapper, bottleneck_layer_i
     batch_idx = np.random.permutation(np.arange(len(train_dataset)))[:max(bottleneck_size, args.salience_check_samples)]
     
     batch = [train_dataset[i] for i in batch_idx]
-    batch = [x[0] for x in batch]
+    # batch = [x[0] for x in batch]
     batch_loader = DataLoader(batch, args.batch_size)
     
     torch.cuda.ipc_collect()
@@ -563,7 +563,7 @@ if __name__ == '__main__':
     parser.add_argument('--test_only', action='store_true')
     parser.add_argument('--early_stop', action='store_true')
     parser.add_argument('--no_normalization', action='store_true')
-    parser.add_argument('--scale_by_grad', action='store_true')
+    parser.add_argument('--scale_by_grad', type=str, default='none', choices=('none', 'output', 'loss'))
     args = parser.parse_args()
 
     np.random.seed(1494)
