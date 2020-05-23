@@ -157,7 +157,7 @@ class ModelWrapper2(ModelWrapper):
     #         'A2': A2
     #     }    
 
-    def score_neurons(self, Z, init_A = None):
+    def score_neurons(self, Z, init_A = None, normalize=True):
         size = Z.shape[1]
         inv_eye = (1-torch.eye(size, device=self.device, requires_grad=False))        
         if init_A is None:
@@ -206,7 +206,8 @@ class ModelWrapper2(ModelWrapper):
         for bi,z in enumerate(loader):
             z = z.cuda()
             avg_error += torch.norm(z-z.mm(A), p=2, dim=0).detach().cpu().numpy()
-        avg_error /= A.shape[0]
+        if normalize:
+            avg_error /= A.shape[0]
 
         A = A.detach()
         hist, bins = np.histogram(A.cpu().numpy().reshape(-1), bins=10)
@@ -220,7 +221,7 @@ class ModelWrapper2(ModelWrapper):
         scores = -1 * avg_error
         return A, scores
     
-    def compute_neuron_derivatives(self, Z, Y, model):
+    def compute_neuron_derivatives(self, Z, Y, model, normalize=True):
         dataset = TensorDataset(Z, Y)
         loader = DataLoader(dataset, batch_size=1, shuffle=False)
 
@@ -242,12 +243,13 @@ class ModelWrapper2(ModelWrapper):
             _z_grad = _z_grad.squeeze(0).view(z.shape[1],-1).sum(1).detach().cpu().numpy()            
             z_grad += _z_grad
         z_grad = np.abs(z_grad)
-        z_grad /= z_grad.sum()
+        if normalize:
+            z_grad /= z_grad.sum()
         print(z_grad.shape)
         print(z_grad.max(), z_grad.mean(), z_grad.min())
         return z_grad
         
-    def compute_prune_probability(self, i, data, flatten_conv_map=False, init_A1=None, init_A2=None):        
+    def compute_prune_probability(self, i, data, flatten_conv_map=False, init_A1=None, init_A2=None, normalize=True):        
         k = i
         while i+1 < len(self.layers) and not utils.is_weighted(self.layers[i+1]) and not isinstance(self.layers[i+1], Flatten) and not isinstance(self.layers[i+1], nn.Dropout):
             i += 1
@@ -268,7 +270,7 @@ class ModelWrapper2(ModelWrapper):
         Y = torch.cat(Ys,dim=0)
 
         if self.args.scale_by_grad != 'none':
-            scale = self.compute_neuron_derivatives(Z, Y, self.layers[i+1:])
+            scale = self.compute_neuron_derivatives(Z, Y, self.layers[i+1:], normalize=normalize)
         else:
             scale = 1
 
@@ -283,7 +285,7 @@ class ModelWrapper2(ModelWrapper):
         ones = torch.ones((Z.shape[0],1), device=Z.device)
         Z = torch.cat((Z,ones), dim=1)
         print('Z.shape =', Z.shape)
-        A, scores = self.score_neurons(Z, init_A=init_A)        
+        A, scores = self.score_neurons(Z, init_A=init_A, normalize=normalize)        
         scores = scores[:-1]
         scores = scores*scale
 
@@ -466,7 +468,7 @@ class ModelWrapper2(ModelWrapper):
 
         return new_layer
 
-    def shrink_layer(self, i, data, factor=1, difference=0):        
+    def shrink_layer(self, i, data, factor=1, difference=0, pruned_neurons=None):        
         if i == len(self.layers)-1 or i == -1:
             raise IndexError('Can not shrink output layer')
 
@@ -477,36 +479,40 @@ class ModelWrapper2(ModelWrapper):
         # print(A1)
 
         outsize, _ = utils.get_layer_input_output_size(self.layers[i])
-        new_size = int(outsize*factor - difference)
-        if self.args.readjust_weights:            
-            A, salience_scores, mean_Z = self.compute_prune_probability(i, data)
-            # if self.is_last_conv(i):
-            #     del A
-            #     torch.cuda.ipc_collect()
-            #     A, _, mean_Z = self.compute_prune_probability(i, data, flatten_conv_map=True)
-            #     torch.cuda.ipc_collect()
+        if pruned_neurons is None:
+            new_size = int(outsize*factor - difference)
+            if self.args.readjust_weights:            
+                A, salience_scores, mean_Z = self.compute_prune_probability(i, data)
+                # if self.is_last_conv(i):
+                #     del A
+                #     torch.cuda.ipc_collect()
+                #     A, _, mean_Z = self.compute_prune_probability(i, data, flatten_conv_map=True)
+                #     torch.cuda.ipc_collect()
+            else:
+                _, salience_scores, _ = self.compute_prune_probability(i, data)
+
+
+            prune_probs = utils.Softmax(salience_scores, 0, 1)
+
+            # salience_scores = np.random.rand(outsize)
+            # salience_scores /= np.sum(salience_scores)
+            print(salience_scores.shape)        
+            if salience_scores.shape[0] <= 1:
+                return False
+            # pruned_neurons = np.random.choice(np.arange(len(salience_scores)), 
+            #                                     (outsize - new_size), 
+            #                                     replace=False, p=prune_probs)  
+            pruned_neurons = sorted(range(len(salience_scores)), 
+                                        key=lambda k: salience_scores[k],
+                                        reverse=True)[:(outsize - new_size)]        
+            # print(salience_scores)
+            # print(salience_scores[pruned_neurons])
+            print('mean error in removed neurons: ', np.mean(salience_scores[pruned_neurons]))
+            self.logger.info('mean error in removed neurons: %f' % np.mean(salience_scores[pruned_neurons]))
+            pruned_neurons = sorted(pruned_neurons)
         else:
-            _, salience_scores, _ = self.compute_prune_probability(i, data)
-
-
-        prune_probs = utils.Softmax(salience_scores, 0, 1)
-
-        # salience_scores = np.random.rand(outsize)
-        # salience_scores /= np.sum(salience_scores)
-        print(salience_scores.shape)        
-        if salience_scores.shape[0] <= 1:
-            return False
-        # pruned_neurons = np.random.choice(np.arange(len(salience_scores)), 
-        #                                     (outsize - new_size), 
-        #                                     replace=False, p=prune_probs)  
-        pruned_neurons = sorted(range(len(salience_scores)), 
-                                    key=lambda k: salience_scores[k],
-                                    reverse=True)[:(outsize - new_size)]        
-        # print(salience_scores)
-        # print(salience_scores[pruned_neurons])
-        print('mean error in removed neurons: ', np.mean(salience_scores[pruned_neurons]))
-        self.logger.info('mean error in removed neurons: %f' % np.mean(salience_scores[pruned_neurons]))
-        pruned_neurons = sorted(pruned_neurons)
+            if self.args.readjust_weights:            
+                A, salience_scores, mean_Z = self.compute_prune_probability(i, data)
         
         k = i+1
         while k < len(self.layers) and not utils.is_weighted(self.layers[k]):

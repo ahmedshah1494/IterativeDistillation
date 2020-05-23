@@ -14,6 +14,7 @@ from multiprocessing import cpu_count
 from copy import deepcopy
 import os
 import pickle
+import itertools
 
 class StudentModelWrapper(nn.Module, models.ModelWrapper):
     def __init__(self, model, logger, args):
@@ -372,6 +373,65 @@ def iterative_distillation(student_model:StudentModelWrapper, bottleneck_layer_i
     logger.info('val_metric:%f'%val_metric)
     return student_model
 
+def global_compression(student_model:StudentModelWrapper, train_dataset, 
+                            val_dataset, test_dataset, nclasses, base_metric, 
+                            shrinkable_layers, args, mLogger=None, 
+                            val_metric_fn=utils.compute_correct):
+    if mLogger is not None:
+        logger = mLogger
+    train_loader = DataLoader(train_dataset, args.batch_size, num_workers=cpu_count()//4, shuffle=True)
+    val_loader = DataLoader(val_dataset, args.batch_size, num_workers=cpu_count()//4, shuffle=False)
+
+    torch.save(student_model, args.outfile)
+    student_model = student_model.to(args.device)
+
+    metric = evaluate(student_model, val_dataset, args, val_metric_fn)
+    print('val_metric:', metric)
+    logger.info('val_metric: %0.4f' % metric)
+
+    delta = metric - base_metric
+
+    while delta >= args.tol:
+        print(student_model)   
+        print('saving model...')
+        logger.info('saving model...')
+        torch.save(student_model, args.outfile)
+
+        neuron_scores = []
+        for layer_idx in shrinkable_layers:
+            layer_size,_ = utils.get_layer_input_output_size(student_model.layers[layer_idx])
+            batch_idx = np.random.permutation(np.arange(len(train_dataset)))[:max(layer_size, args.salience_check_samples)]
+        
+            batch = [train_dataset[i] for i in batch_idx]
+            # batch = [x[0] for x in batch]
+            batch_loader = DataLoader(batch, args.batch_size)
+            _, layer_neuron_scores, _ = student_model.compute_prune_probability(layer_idx, batch_loader)
+            neuron_scores.append(layer_neuron_scores)
+        neuron_layer_idxs = [[i]*len(l) for i,l in zip(shrinkable_layers, neuron_scores)]
+        neuron_layer_idxs = list(itertools.chain(*neuron_layer_idxs))
+
+        neuron_idxs = [range(len(l)) for l in neuron_scores]
+        neuron_idxs = list(itertools.chain(*neuron_idxs))
+
+        neuron_scores = list(itertools.chain(*neuron_scores))
+        print(len(neuron_layer_idxs), len(neuron_idxs), len(neuron_scores))
+        sorted_neurons = sorted(zip(neuron_layer_idxs, neuron_idxs, neuron_scores), 
+                                key=lambda x: x[2],
+                                reverse=True)
+        pruned_neurons = sorted_neurons[:int((1-args.shrink_factor)*len(sorted_neurons))]
+        layer2neuron = {}
+        for li,ni,_ in pruned_neurons:
+            layer2neuron.setdefault(li,[]).append(ni)
+        print(layer2neuron)
+        for li in sorted(layer2neuron.keys(), reverse=True):
+            student_model.shrink_layer(li, batch_loader, pruned_neurons=layer2neuron[li])
+    
+    student_model = torch.load(args.outfile).to(args.device)
+    val_metric = evaluate(student_model, val_dataset, args, val_metric_fn)
+    print('val_metric:', val_metric)
+    logger.info('val_metric:%f'%val_metric)
+    return student_model
+
 def simple_distillation(teacher_model: models.ModelWrapper, student_model, train_dataset, val_dataset, nclasses, args):
     base_metric = evaluate(teacher_model, val_dataset, args)
     print('base_metric = %.4f' % (base_metric))
@@ -447,64 +507,67 @@ def main(args):
     logger.info('base_metric = %.4f' % base_metric)
     
     shrinkable_layers = student_model.get_shrinkable_layers() 
-    not_shrinkables = []       
-    if args.reverse_shrink_order:
-        shrinkable_layers = shrinkable_layers[::-1]
-    if args.shrink_all or len(args.shrink_layer_idxs) > 0:  
-        old_num_params = num_params = sum([p.numel() for p in student_model.parameters()])        
-        # rr_iters = args.round_robin_iters if args.round_robin else 1
-        # for rri in range(rr_iters):
-        rri = 0
-
-        shrinkable_layers_ = shrinkable_layers        
-
-        while rri == 0 or old_num_params != num_params:
-            student_model.reset()
-
-            shrinkable_layers = shrinkable_layers_                    
-
-            if len(args.shrink_layer_idxs) > 0:
-                not_shrinkables = [i for i in shrinkable_layers if i not in args.shrink_layer_idxs]
-                shrinkable_layers = args.shrink_layer_idxs
-            else:
-                not_shrinkables = args.exclude_layers[:]
-            
-            if rri == 0 and args.start_layer_idx >= 0 and args.start_layer_idx in shrinkable_layers:
-                if args.reverse_shrink_order:
-                    not_shrinkables += [i for i in shrinkable_layers if i > args.start_layer_idx]
-                else:
-                    not_shrinkables += [i for i in shrinkable_layers if i < args.start_layer_idx]
-                shrinkable_layers = shrinkable_layers[shrinkable_layers.index(args.start_layer_idx):]                        
-                    
-            print(rri, not_shrinkables, shrinkable_layers, args.exclude_layers, args.shrink_layer_idxs)            
-            while len(shrinkable_layers) > 0:
-                student_model = iterative_distillation(student_model, shrinkable_layers[0], train_logits, val_dataset, test_dataset, nclasses, base_metric, args, mLogger=logger)
-                if args.train_on_student:
-                    train_logits = get_logits(student_model, train_dataset, args)
-                print(student_model)
-                new_shrinkable_layers = student_model.get_shrinkable_layers(not_shrinkables)
-                if args.reverse_shrink_order:
-                    new_shrinkable_layers = new_shrinkable_layers[::-1]
-                if shrinkable_layers == new_shrinkable_layers:
-                    not_shrinkables.append(shrinkable_layers[0])            
-                shrinkable_layers = [x for x in new_shrinkable_layers if x not in not_shrinkables]            
-                print(not_shrinkables, shrinkable_layers)
-            
-            if not args.round_robin:
-                break
-
-            old_num_params = num_params
-            num_params = sum([p.numel() for p in student_model.parameters()])
-            num_dense = sum([sum([p.numel() for p in m.parameters()]) for m in student_model.modules() if isinstance(m,nn.Linear)])
-            num_conv = sum([sum([p.numel() for p in m.parameters()]) for m in student_model.modules() if isinstance(m,nn.Conv2d)])
-            print('change in num_params: %d -> %d' % (old_num_params, num_params))
-            logger.info('num params: %d' % num_params)
-            logger.info('num dense: %d' % num_dense)
-            logger.info('num conv: %d' % num_conv)
-            rri += 1
-            
+    if args.global_pruning:
+        student_model = global_compression(student_model, train_logits, val_dataset, test_dataset, nclasses, base_metric, shrinkable_layers, args, mLogger=logger)
     else:
-        student_model = iterative_distillation(student_model, shrinkable_layers[args.start_layer_idx], train_logits, val_dataset, test_dataset, nclasses, base_metric, args, mLogger=logger)
+        not_shrinkables = []       
+        if args.reverse_shrink_order:
+            shrinkable_layers = shrinkable_layers[::-1]
+        if args.shrink_all or len(args.shrink_layer_idxs) > 0:  
+            old_num_params = num_params = sum([p.numel() for p in student_model.parameters()])        
+            # rr_iters = args.round_robin_iters if args.round_robin else 1
+            # for rri in range(rr_iters):
+            rri = 0
+
+            shrinkable_layers_ = shrinkable_layers        
+
+            while rri == 0 or old_num_params != num_params:
+                student_model.reset()
+
+                shrinkable_layers = shrinkable_layers_                    
+
+                if len(args.shrink_layer_idxs) > 0:
+                    not_shrinkables = [i for i in shrinkable_layers if i not in args.shrink_layer_idxs]
+                    shrinkable_layers = args.shrink_layer_idxs
+                else:
+                    not_shrinkables = args.exclude_layers[:]
+                
+                if rri == 0 and args.start_layer_idx >= 0 and args.start_layer_idx in shrinkable_layers:
+                    if args.reverse_shrink_order:
+                        not_shrinkables += [i for i in shrinkable_layers if i > args.start_layer_idx]
+                    else:
+                        not_shrinkables += [i for i in shrinkable_layers if i < args.start_layer_idx]
+                    shrinkable_layers = shrinkable_layers[shrinkable_layers.index(args.start_layer_idx):]                        
+                        
+                print(rri, not_shrinkables, shrinkable_layers, args.exclude_layers, args.shrink_layer_idxs)            
+                while len(shrinkable_layers) > 0:
+                    student_model = iterative_distillation(student_model, shrinkable_layers[0], train_logits, val_dataset, test_dataset, nclasses, base_metric, args, mLogger=logger)
+                    if args.train_on_student:
+                        train_logits = get_logits(student_model, train_dataset, args)
+                    print(student_model)
+                    new_shrinkable_layers = student_model.get_shrinkable_layers(not_shrinkables)
+                    if args.reverse_shrink_order:
+                        new_shrinkable_layers = new_shrinkable_layers[::-1]
+                    if shrinkable_layers == new_shrinkable_layers:
+                        not_shrinkables.append(shrinkable_layers[0])            
+                    shrinkable_layers = [x for x in new_shrinkable_layers if x not in not_shrinkables]            
+                    print(not_shrinkables, shrinkable_layers)
+                
+                if not args.round_robin:
+                    break
+
+                old_num_params = num_params
+                num_params = sum([p.numel() for p in student_model.parameters()])
+                num_dense = sum([sum([p.numel() for p in m.parameters()]) for m in student_model.modules() if isinstance(m,nn.Linear)])
+                num_conv = sum([sum([p.numel() for p in m.parameters()]) for m in student_model.modules() if isinstance(m,nn.Conv2d)])
+                print('change in num_params: %d -> %d' % (old_num_params, num_params))
+                logger.info('num params: %d' % num_params)
+                logger.info('num dense: %d' % num_dense)
+                logger.info('num conv: %d' % num_conv)
+                rri += 1
+                
+        else:
+            student_model = iterative_distillation(student_model, shrinkable_layers[args.start_layer_idx], train_logits, val_dataset, test_dataset, nclasses, base_metric, args, mLogger=logger)
 
     print(student_model)
     test_metric = evaluate(student_model, test_dataset, args)
@@ -564,6 +627,7 @@ if __name__ == '__main__':
     parser.add_argument('--early_stop', action='store_true')
     parser.add_argument('--no_normalization', action='store_true')
     parser.add_argument('--scale_by_grad', type=str, default='none', choices=('none', 'output', 'loss'))
+    parser.add_argument('--global_pruning', action='store_true')
     args = parser.parse_args()
 
     np.random.seed(1494)
