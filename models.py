@@ -468,7 +468,7 @@ class ModelWrapper2(ModelWrapper):
 
         return new_layer
 
-    def shrink_layer(self, i, data, factor=1, difference=0, pruned_neurons=None):        
+    def shrink_layer(self, i, data, factor=1, difference=0, pruned_neurons=None, A=None, mean_Z=None):        
         if i == len(self.layers)-1 or i == -1:
             raise IndexError('Can not shrink output layer')
 
@@ -511,7 +511,7 @@ class ModelWrapper2(ModelWrapper):
             self.logger.info('mean error in removed neurons: %f' % np.mean(salience_scores[pruned_neurons]))
             pruned_neurons = sorted(pruned_neurons)
         else:
-            if self.args.readjust_weights:            
+            if self.args.readjust_weights and (A is None or mean_Z is None):            
                 A, salience_scores, mean_Z = self.compute_prune_probability(i, data)
         
         k = i+1
