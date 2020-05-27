@@ -390,14 +390,15 @@ def global_compression(student_model:StudentModelWrapper, train_dataset,
     logger.info('val_metric: %0.4f' % metric)
 
     delta = metric - base_metric
-
-    while delta >= args.tol:
-        print(student_model)   
+    print(student_model)
+    while delta >= args.tol:           
         print('saving model...')
         logger.info('saving model...')
         torch.save(student_model, args.outfile)
 
         neuron_scores = []
+        As = {}
+        mean_Zs = {}
         for layer_idx in shrinkable_layers:
             layer_size,_ = utils.get_layer_input_output_size(student_model.layers[layer_idx])
             batch_idx = np.random.permutation(np.arange(len(train_dataset)))[:max(layer_size, args.salience_check_samples)]
@@ -405,8 +406,11 @@ def global_compression(student_model:StudentModelWrapper, train_dataset,
             batch = [train_dataset[i] for i in batch_idx]
             # batch = [x[0] for x in batch]
             batch_loader = DataLoader(batch, args.batch_size)
-            _, layer_neuron_scores, _ = student_model.compute_prune_probability(layer_idx, batch_loader)
+            A, layer_neuron_scores, mean_z = student_model.compute_prune_probability(layer_idx, batch_loader, normalize=False)
+            A = A.detach().cpu()
             neuron_scores.append(layer_neuron_scores)
+            As[layer_idx] = A
+            mean_Zs[layer_idx] = mean_z
         neuron_layer_idxs = [[i]*len(l) for i,l in zip(shrinkable_layers, neuron_scores)]
         neuron_layer_idxs = list(itertools.chain(*neuron_layer_idxs))
 
@@ -424,7 +428,23 @@ def global_compression(student_model:StudentModelWrapper, train_dataset,
             layer2neuron.setdefault(li,[]).append(ni)
         print(layer2neuron)
         for li in sorted(layer2neuron.keys(), reverse=True):
-            student_model.shrink_layer(li, batch_loader, pruned_neurons=layer2neuron[li])
+            student_model.shrink_layer(li, batch_loader, 
+                                        pruned_neurons=layer2neuron[li], 
+                                        A=As.pop(li).to(student_model.device), 
+                                        mean_Z=mean_Zs[li]
+                                        )
+        print(student_model)
+        metric = evaluate(student_model, val_dataset, args, val_metric_fn)
+        print('val_metric:', metric)
+        logger.info('val_metric: %0.4f' % metric)
+
+        delta = metric - base_metric
+        if delta < args.tol:
+            metric = distill(student_model, train_loader, val_loader, base_metric, args, val_metric_fn, mLogger)
+            torch.cuda.ipc_collect()
+            print('current metric = %.4f base_metric = %.4f' % (metric, base_metric))
+            logger.info('current metric = %.4f base_metric = %.4f' % (metric, base_metric))
+        delta = metric - base_metric
     
     student_model = torch.load(args.outfile).to(args.device)
     val_metric = evaluate(student_model, val_dataset, args, val_metric_fn)
