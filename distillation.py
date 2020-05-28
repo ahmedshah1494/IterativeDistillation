@@ -533,6 +533,8 @@ def main(args):
         not_shrinkables = []       
         if args.reverse_shrink_order:
             shrinkable_layers = shrinkable_layers[::-1]
+        if args.random_shrink_order:
+            np.random.shuffle(shrinkable_layers)
         if args.shrink_all or len(args.shrink_layer_idxs) > 0:  
             old_num_params = num_params = sum([p.numel() for p in student_model.parameters()])        
             # rr_iters = args.round_robin_iters if args.round_robin else 1
@@ -568,7 +570,9 @@ def main(args):
                     new_shrinkable_layers = student_model.get_shrinkable_layers(not_shrinkables)
                     if args.reverse_shrink_order:
                         new_shrinkable_layers = new_shrinkable_layers[::-1]
-                    if shrinkable_layers == new_shrinkable_layers:
+                    if args.random_shrink_order:
+                        np.random.shuffle(new_shrinkable_layers)
+                    if set(shrinkable_layers) == set(new_shrinkable_layers):
                         not_shrinkables.append(shrinkable_layers[0])            
                     shrinkable_layers = [x for x in new_shrinkable_layers if x not in not_shrinkables]            
                     print(not_shrinkables, shrinkable_layers)
@@ -626,6 +630,7 @@ if __name__ == '__main__':
     parser.add_argument('--fine_tune', action='store_true')
     parser.add_argument('--fine_tune_only', action='store_true')
     parser.add_argument('--reverse_shrink_order', action='store_true')
+    parser.add_argument('--random_shrink_order', action='store_true')
     parser.add_argument('--round_robin', action='store_true')
     parser.add_argument('--round_robin_iters', type=int, default=10)
     parser.add_argument('--train_on_student', action='store_true')
@@ -648,11 +653,12 @@ if __name__ == '__main__':
     parser.add_argument('--no_normalization', action='store_true')
     parser.add_argument('--scale_by_grad', type=str, default='none', choices=('none', 'output', 'loss'))
     parser.add_argument('--global_pruning', action='store_true')
+    parser.add_argument('--random_seed', type=int, default=1494)
     args = parser.parse_args()
 
-    np.random.seed(1494)
-    torch.manual_seed(1494)
-    torch.cuda.manual_seed_all(1494)
+    np.random.seed(args.random_seed)
+    torch.manual_seed(args.random_seed)
+    torch.cuda.manual_seed_all(args.random_seed)
 
     if not os.path.exists(os.path.dirname(args.logfile)):
         os.makedirs(os.path.dirname(args.logfile))
