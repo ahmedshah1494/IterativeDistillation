@@ -147,6 +147,7 @@ def distill(student_model, train_loader, val_loader, base_metric, args, val_metr
         epoch_soft_loss = 0
         epoch_hard_loss = 0
         epoch_correct = 0
+        epoch_mi = 0
         count = 0        
         for j,(x,y,z) in enumerate(train_loader):
             student_model = student_model.train()
@@ -158,6 +159,20 @@ def distill(student_model, train_loader, val_loader, base_metric, args, val_metr
                                                                     loss_weight=loss_w, 
                                                                     C=args.C, T=T, 
                                                                     soft_loss_type=args.soft_loss_type)
+            if args.use_IB:
+                feats = student_model.layers[:-1](x)
+                _x = x.view(x.shape[0], -1)                
+                minet = models.MINet(feats.shape[1], _x.shape[1], 512, 1, args.device)
+                mi_optimizer = torch.optim.Adam(minet.parameters(), lr=args.mi_lr)
+                mi_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(mi_optimizer, 
+                                        factor=0.5, patience=3, verbose=False)
+                minet.fit([(feats.detach(),_x.detach())], args.mi_iters, mi_optimizer, mi_scheduler, verbose=False)
+                minet.eval()
+                j,m = minet(feats, _x)
+                mi = minet.compute_nim(j,m).mean()
+                train_loss += 1e-3 * mi
+                epoch_mi += float(mi)
+                
             train_loss.backward()
             nn.utils.clip_grad_norm_(student_model.parameters(), 5.0)
             optimizer.step()
@@ -169,7 +184,7 @@ def distill(student_model, train_loader, val_loader, base_metric, args, val_metr
         epoch_loss /= count
         epoch_soft_loss /= count
         epoch_hard_loss /= count
-
+        epoch_mi /= count
         val_correct = 0
         count = 0        
         for batch in val_loader:
@@ -203,12 +218,12 @@ def distill(student_model, train_loader, val_loader, base_metric, args, val_metr
         # t.set_postfix(train_loss=epoch_loss, train_soft_loss=epoch_soft_loss, train_hard_loss=epoch_hard_loss, 
         #                 val_acc=val_acc, lr=optimizer.param_groups[0]['lr'], T=T, lossW=loss_w)        
         # if i % 10 == 0:
-        print('epoch#%d train_loss=%.3f train_hard_loss=%.3f train_soft_loss=%.3f val_acc=%.3f lr=%.4E' % (i, epoch_loss, epoch_hard_loss, epoch_soft_loss, val_acc, optimizer.param_groups[0]['lr']))
+        print('epoch#%d train_loss=%.3f train_hard_loss=%.3f train_soft_loss=%.3f val_acc=%.3f MI=%.3f lr=%.4E' % (i, epoch_loss, epoch_hard_loss, epoch_soft_loss, val_acc, epoch_mi, optimizer.param_groups[0]['lr']))
         if logger is not None:
-            logger.info('epoch#%d train_loss=%.3f train_hard_loss=%.3f train_soft_loss=%.3f val_acc=%.3f lr=%.4E' % (i, epoch_loss, epoch_hard_loss, epoch_soft_loss, val_acc, optimizer.param_groups[0]['lr']))
+            logger.info('epoch#%d train_loss=%.3f train_hard_loss=%.3f train_soft_loss=%.3f val_acc=%.3f MI=%.3f lr=%.4E' % (i, epoch_loss, epoch_hard_loss, epoch_soft_loss, val_acc, epoch_mi, optimizer.param_groups[0]['lr']))
         if val_acc-base_metric >= args.tol:
             if logger is not None:
-                logger.info('epoch#%d train_loss=%.3f train_hard_loss=%.3f train_soft_loss=%.3f val_acc=%.3f lr=%.4E' % (i, epoch_loss, epoch_hard_loss, epoch_soft_loss, val_acc, optimizer.param_groups[0]['lr']))
+                logger.info('epoch#%d train_loss=%.3f train_hard_loss=%.3f train_soft_loss=%.3f val_acc=%.3f MI=%.3f lr=%.4E' % (i, epoch_loss, epoch_hard_loss, epoch_soft_loss, val_acc, epoch_mi, optimizer.param_groups[0]['lr']))
             break
     return val_acc
     
@@ -654,6 +669,11 @@ if __name__ == '__main__':
     parser.add_argument('--scale_by_grad', type=str, default='none', choices=('none', 'output', 'loss'))
     parser.add_argument('--global_pruning', action='store_true')
     parser.add_argument('--random_seed', type=int, default=1494)
+    parser.add_argument('--scale_by_mi', action='store_true')
+    parser.add_argument('--mi_lr', type=float, default=1e-3)
+    parser.add_argument('--mi_batch_size', type=int, default=256)
+    parser.add_argument('--mi_iters', type=int, default=1000)
+    parser.add_argument('--use_IB', action='store_true')
     args = parser.parse_args()
 
     np.random.seed(args.random_seed)
