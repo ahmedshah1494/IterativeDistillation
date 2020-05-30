@@ -9,6 +9,7 @@ import types
 import time
 import sys
 from wide_resnet import Wide_ResNet
+from tqdm import tqdm
 
 class WideResNetEncoder(nn.Module):
     def __init__(self, ):
@@ -122,6 +123,64 @@ class ModelWrapper(object):
                     if not isinstance(self.layers[i], nn.BatchNorm2d):
                         break
             return True
+
+class MINet(nn.Module):
+    def __init__(self, x_size, y_size, hidden_size, outsize, device):
+        super(MINet, self).__init__()
+        self.fc_x = nn.Linear(x_size, hidden_size)
+        self.fc_y = nn.Linear(y_size, hidden_size)
+        self.mlp = nn.Sequential(
+            nn.Linear(2*hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, outsize),
+        )
+        self.device = device
+        self.to(device)
+    def forward(self, x, y):
+        proj_x = self.fc_x(x)
+        proj_y = self.fc_y(y)
+
+        cat = torch.cat((proj_x, proj_y), dim=1)
+        joint = self.mlp(cat)
+
+        rand_idxs = np.arange(len(y))
+        np.random.shuffle(rand_idxs)
+        cat = torch.cat((proj_x, proj_y[rand_idxs]), dim=1)
+        marginal = self.mlp(cat)        
+        return joint, marginal
+        
+    def compute_nim(self, joint, marginal):
+        return joint.mean(0) - (torch.logsumexp(marginal, dim=0) - np.log(len(marginal)))
+
+    def fit(self, loader, epochs, optimizer, scheduler, verbose=True):
+        patience = 10
+        bad_iters = 0
+        prev_error = sys.maxsize
+
+        for e in range(epochs):
+            avg_loss = 0            
+            for bi,(x,y) in enumerate(loader):
+                x = x.to(self.device)
+                y = y.to(self.device)
+
+                optimizer.zero_grad()
+                joint, marginal = self.forward(x, y)
+                loss = -self.compute_nim(joint, marginal).mean() 
+                loss.backward()                
+                optimizer.step()
+                avg_loss = (bi*avg_loss + loss)/(bi+1)
+            scheduler.step(avg_loss)            
+            if verbose:
+                print('%d/%d' % (e+1,epochs), float(avg_loss), bad_iters)
+            # t.set_postfix(loss=avg_loss, bad_iters=bad_iters)
+            if np.isclose(float(avg_loss), float(prev_error)) or avg_loss > prev_error:
+                if bad_iters >= patience -1:
+                    break
+                else:
+                    bad_iters += 1
+            else:
+                bad_iters = 0
+                prev_error = avg_loss
 
 class ModelWrapper2(ModelWrapper):
     # shrinking_state = {
@@ -248,7 +307,33 @@ class ModelWrapper2(ModelWrapper):
         print(z_grad.shape)
         print(z_grad.max(), z_grad.mean(), z_grad.min())
         return z_grad
+    
+    def compute_neuron_mutual_info(self, X, Y):        
+        minet = MINet(X.shape[1], Y.shape[1], 128, X.shape[1] , self.device)
+    
+        optimizer = torch.optim.Adam(minet.parameters(), 
+                                        lr=self.args.mi_lr)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 
+                                        factor=0.5, patience=3, verbose=True)
+        print(X.shape, Y.shape)
+        loader = DataLoader(list(zip(X,Y)), batch_size=self.args.mi_batch_size, shuffle=True)
         
+        minet.fit(loader, self.args.mi_iters, optimizer, scheduler)
+        minet.eval()
+
+        joint = []
+        marginal = []
+        for x,y in loader:
+            x = x.to(self.device)
+            y = y.to(self.device)
+            _joint, _marginal = minet(x,y)
+            joint.append(_joint.detach().cpu())
+            marginal.append(_marginal.detach().cpu())
+        joint = torch.cat(joint, dim=0)
+        marginal = torch.cat(marginal, dim=0)
+        mi = minet.compute_nim(joint, marginal).detach().cpu().numpy()
+        return mi        
+
     def compute_prune_probability(self, i, data, flatten_conv_map=False, init_A1=None, init_A2=None, normalize=True):        
         k = i
         while i+1 < len(self.layers) and not utils.is_weighted(self.layers[i+1]) and not isinstance(self.layers[i+1], Flatten) and not isinstance(self.layers[i+1], nn.Dropout):
@@ -261,14 +346,16 @@ class ModelWrapper2(ModelWrapper):
         print('------------------------------------------------------------')
         Zs = []
         Ys = []
+        Xs = []
         for x,y,_ in data:
             x = x.to(self.device)
             Z = trunc_model(x)
             Zs.append(Z.detach().cpu())
             Ys.append(y.detach().cpu())
+            Xs.append(x.detach().cpu())
         Z = torch.cat(Zs,dim=0)
         Y = torch.cat(Ys,dim=0)
-
+        X = torch.cat(Xs,dim=0)
         if self.args.scale_by_grad != 'none':
             scale = self.compute_neuron_derivatives(Z, Y, self.layers[i+1:], normalize=normalize)
         else:
@@ -281,7 +368,13 @@ class ModelWrapper2(ModelWrapper):
         else:
             Z = Z.contiguous().view(-1, Z.shape[-1])
             init_A = init_A1
-
+        
+        if self.args.scale_by_mi:
+            mi_zx = self.compute_neuron_mutual_info(Z, X.view(X.shape[0], -1))
+            mi_zy = self.compute_neuron_mutual_info(Z, Y.view(Y.shape[0], 1).float())
+            mi_ratio = mi_zy / mi_zx + 1e-8
+            scale *= mi_ratio
+            print('mi_ratio - min: %f mean: %f max: %f' % (mi_ratio.min(), mi_ratio.mean(), mi_ratio.max()))
         ones = torch.ones((Z.shape[0],1), device=Z.device)
         Z = torch.cat((Z,ones), dim=1)
         print('Z.shape =', Z.shape)
