@@ -301,9 +301,10 @@ class ModelWrapper2(ModelWrapper):
             _z_grad = z.grad
             _z_grad = _z_grad.squeeze(0).view(z.shape[1],-1).sum(1).detach().cpu().numpy()            
             z_grad += _z_grad
-        z_grad = np.abs(z_grad)
-        if normalize:
-            z_grad /= z_grad.sum()
+        if self.args.scale_by_grad == 'output':
+            z_grad = np.abs(z_grad)
+            if normalize:
+                z_grad /= z_grad.sum()        
         print(z_grad.shape)
         print(z_grad.max(), z_grad.mean(), z_grad.min())
         return z_grad
@@ -421,7 +422,7 @@ class ModelWrapper2(ModelWrapper):
             print('w_norm:',w_norm)
             future_error = (torch.abs(A[:, j]) * mean_Z[j]).mean()
 
-            if (update_norm > 1 and update_norm > w_norm) or future_error > 1.0:# and ((ji) % weight_block_size == 0):
+            if (update_norm > 1 and update_norm > w_norm):# or future_error > 1.0:# and ((ji) % weight_block_size == 0):
                 print('update norm too large, breaking...')
                 break
 
@@ -685,6 +686,26 @@ class Flatten(nn.Module):
     def forward(self, x):
         return x.view(x.shape[0], -1)
 
+class LeNet(nn.Module, ModelWrapper):
+    def __init__(self, num_classes):
+        super(LeNet, self).__init__()
+        self.layers = nn.Sequential(
+            nn.Conv2d(1, 6, 5, padding=2),
+            nn.ReLU(),
+            nn.MaxPool2d(2, 2),
+            nn.Conv2d(6, 16, 5, padding=2),
+            nn.ReLU(),
+            nn.MaxPool2d(2, 2),
+            nn.Conv2d(16, 120, 5, padding=2),
+            nn.ReLU(),
+            nn.AdaptiveMaxPool2d((1, 1)),
+            Flatten(),
+            nn.Linear(120, 84),
+            nn.ReLU(),
+            nn.Linear(84, 10)
+        )
+    def forward(self, x):
+        return self.layers(x)
 class AlexNet(nn.Module, ModelWrapper):
     def __init__(self, num_classes):
         super(AlexNet, self).__init__()
@@ -1009,6 +1030,10 @@ def alexnetCIFAR(num_classes, pretrained=False, feature_extraction=False, classi
 
 def papernot(num_classes, pretrained=False, feature_extraction=False, **kwargs):
     m = PapernotCIFAR10(num_classes)
+    return m
+
+def lenet(num_classes, pretrained=False, feature_extraction=False, classifier_depth=1, **kwargs):
+    m = LeNet(num_classes)
     return m
 
 def setup_feature_extraction_model(model, model_type, num_classes, classifier_depth=1):
