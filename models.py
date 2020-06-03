@@ -262,9 +262,12 @@ class ModelWrapper2(ModelWrapper):
                 prev_error = avg_loss
         
         avg_error = 0
+        residual = []
         for bi,z in enumerate(loader):
             z = z.cuda()
-            avg_error += torch.norm(z-z.mm(A), p=2, dim=0).detach().cpu().numpy()
+            delta = (z-z.mm(A)).detach().cpu().numpy()
+            residual.append(delta)
+            avg_error += np.linalg.norm(delta, axis=0)
         if normalize:
             avg_error /= A.shape[0]
 
@@ -278,7 +281,7 @@ class ModelWrapper2(ModelWrapper):
         # avg_error = torch.sqrt(((Z-Z.mm(A))**2).sum(0)).detach().cpu().numpy()
         # avg_error /= A.shape[0]
         scores = -1 * avg_error
-        return A, scores
+        return A, scores, np.concatenate(residual, axis=0)
     
     def compute_neuron_derivatives(self, Z, Y, model, normalize=True):
         dataset = TensorDataset(Z, Y)
@@ -301,9 +304,10 @@ class ModelWrapper2(ModelWrapper):
             _z_grad = z.grad
             _z_grad = _z_grad.squeeze(0).view(z.shape[1],-1).sum(1).detach().cpu().numpy()            
             z_grad += _z_grad
-        z_grad = np.abs(z_grad)
-        if normalize:
-            z_grad /= z_grad.sum()
+        if self.args.scale_by_grad == 'output':
+            z_grad = np.abs(z_grad)
+            if normalize:
+                z_grad /= z_grad.sum()        
         print(z_grad.shape)
         print(z_grad.max(), z_grad.mean(), z_grad.min())
         return z_grad
@@ -369,16 +373,27 @@ class ModelWrapper2(ModelWrapper):
             Z = Z.contiguous().view(-1, Z.shape[-1])
             init_A = init_A1
         
-        if self.args.scale_by_mi:
+        if self.args.scale_by_mi == 'features':
             mi_zx = self.compute_neuron_mutual_info(Z, X.view(X.shape[0], -1))
             mi_zy = self.compute_neuron_mutual_info(Z, Y.view(Y.shape[0], 1).float())
             mi_ratio = mi_zy / mi_zx + 1e-8
-            scale *= mi_ratio
+            scale *= mi_ratio        
             print('mi_ratio - min: %f mean: %f max: %f' % (mi_ratio.min(), mi_ratio.mean(), mi_ratio.max()))
+
         ones = torch.ones((Z.shape[0],1), device=Z.device)
         Z = torch.cat((Z,ones), dim=1)
         print('Z.shape =', Z.shape)
-        A, scores = self.score_neurons(Z, init_A=init_A, normalize=normalize)        
+        A, scores, residuals = self.score_neurons(Z, init_A=init_A, normalize=normalize)
+        if self.args.scale_by_grad == 'loss':
+            scores = residuals.mean(0)
+        if self.args.scale_by_mi == 'residual':
+            delta = torch.from_numpy(residuals[:, :-1])
+            mi_zx = self.compute_neuron_mutual_info(delta, X.view(X.shape[0], -1))
+            mi_zy = self.compute_neuron_mutual_info(delta, Y.view(Y.shape[0], 1).float())
+            mi_ratio = mi_zy - mi_zx
+            scale *= mi_ratio
+            print('mi_ratio - min: %f mean: %f max: %f' % (mi_ratio.min(), mi_ratio.mean(), mi_ratio.max()))
+                        
         scores = scores[:-1]
         scores = scores*scale
 
