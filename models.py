@@ -301,10 +301,9 @@ class ModelWrapper2(ModelWrapper):
             _z_grad = z.grad
             _z_grad = _z_grad.squeeze(0).view(z.shape[1],-1).sum(1).detach().cpu().numpy()            
             z_grad += _z_grad
-        if self.args.scale_by_grad == 'output':
-            z_grad = np.abs(z_grad)
-            if normalize:
-                z_grad /= z_grad.sum()        
+        z_grad = np.abs(z_grad)
+        if normalize:
+            z_grad /= z_grad.sum()
         print(z_grad.shape)
         print(z_grad.max(), z_grad.mean(), z_grad.min())
         return z_grad
