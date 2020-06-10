@@ -11,6 +11,16 @@ import sys
 from wide_resnet import Wide_ResNet
 from tqdm import tqdm
 
+class GaussianSmoothingLayer(nn.Module):
+    def __init__(self, sigma):
+        super(GaussianSmoothingLayer, self).__init__()
+        self.sigma = sigma
+
+    def forward(self, x):
+        eps = torch.normal(mean=0, std=self.sigma,size=x.shape).to(x.device)
+        x += eps
+        return x
+
 class WideResNetEncoder(nn.Module):
     def __init__(self, ):
         super(WideResNetEncoder, self).__init__()
@@ -373,29 +383,48 @@ class ModelWrapper2(ModelWrapper):
             Z = Z.contiguous().view(-1, Z.shape[-1])
             init_A = init_A1
         
-        if self.args.scale_by_mi == 'features':
-            mi_zx = self.compute_neuron_mutual_info(Z, X.view(X.shape[0], -1))
-            mi_zy = self.compute_neuron_mutual_info(Z, Y.view(Y.shape[0], 1).float())
-            mi_ratio = mi_zy / mi_zx + 1e-8
-            scale *= mi_ratio        
+        if self.args.scale_by_mi == 'features' or self.args.score_by_mi == 'features':
+            if self.args.mizx_weight > 0:
+                mi_zx = self.compute_neuron_mutual_info(Z, X.view(X.shape[0], -1))
+                print('mi_zx - min: %f mean: %f max: %f' % (mi_zx.min(), mi_zx.mean(), mi_zx.max()))
+            else:
+                mi_zx = 0
+            mi_zy = self.compute_neuron_mutual_info(Z, Y.view(Y.shape[0], 1).float())             
+            mi_ratio = mi_zy - self.args.mizx_weight * mi_zx
+            if self.args.scale_by_mi == 'features':
+                scale *= mi_ratio
+            else:
+                scores = mi_ratio
+            
+            print('mi_zy - min: %f mean: %f max: %f' % (mi_zy.min(), mi_zy.mean(), mi_zy.max()))
             print('mi_ratio - min: %f mean: %f max: %f' % (mi_ratio.min(), mi_ratio.mean(), mi_ratio.max()))
 
         ones = torch.ones((Z.shape[0],1), device=Z.device)
         Z = torch.cat((Z,ones), dim=1)
         print('Z.shape =', Z.shape)
         A, scores, residuals = self.score_neurons(Z, init_A=init_A, normalize=normalize)
+        
         if self.args.scale_by_grad == 'loss':
             scores = residuals.mean(0)
-        if self.args.scale_by_mi == 'residual':
-            delta = torch.from_numpy(residuals[:, :-1])
-            mi_zx = self.compute_neuron_mutual_info(delta, X.view(X.shape[0], -1))
+        if self.args.scale_by_mi == 'residual' or self.args.score_by_mi == 'residual':
+            delta = torch.from_numpy(residuals[:, :-1])            
+            if self.args.mizx_weight > 0:
+                mi_zx = self.compute_neuron_mutual_info(delta, X.view(X.shape[0], -1))
+                print('mi_zx - min: %f mean: %f max: %f' % (mi_zx.min(), mi_zx.mean(), mi_zx.max()))
+            else:
+                mi_zx = 0
             mi_zy = self.compute_neuron_mutual_info(delta, Y.view(Y.shape[0], 1).float())
-            mi_ratio = mi_zy - mi_zx
-            scale *= mi_ratio
+            mi_ratio = mi_zy - self.args.mizx_weight * mi_zx
+            if self.args.scale_by_mi == 'residual':
+                scale *= mi_ratio
+            else:
+                scores = mi_ratio            
+            print('mi_zy - min: %f mean: %f max: %f' % (mi_zy.min(), mi_zy.mean(), mi_zy.max()))
             print('mi_ratio - min: %f mean: %f max: %f' % (mi_ratio.min(), mi_ratio.mean(), mi_ratio.max()))
-                        
-        scores = scores[:-1]
-        scores = scores*scale
+        
+        if self.args.score_by_mi == 'none':
+            scores = scores[:-1]
+            scores = scores*scale
 
         Z = Z.detach().cpu().numpy()
         torch.cuda.ipc_collect()

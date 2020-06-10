@@ -124,7 +124,7 @@ def get_logits(model, dataset, args):
     logits = torch.utils.data.TensorDataset(X,Y,Z)
     return logits
 
-def distill(student_model, train_loader, val_loader, base_metric, args, val_metric_fn=utils.compute_correct, logger=None):    
+def distill(student_model, train_loader, val_loader, base_metric, args, val_metric_fn=utils.compute_correct, logger=None, shrink_layer_idx=None):    
     criterion = distillation_loss
     if args.optimizer == 'adam':
         optimizer = torch.optim.Adam(student_model.parameters(), lr=args.lr, weight_decay=1e-4)
@@ -153,15 +153,12 @@ def distill(student_model, train_loader, val_loader, base_metric, args, val_metr
             student_model = student_model.train()
             optimizer.zero_grad()
             x = x.to(args.device)
-            z_ = student_model(x)
-            y, z = y.to(args.device), z.to(args.device)
-            train_loss, train_soft_loss, train_hard_loss = criterion(z_, z, y, 
-                                                                    loss_weight=loss_w, 
-                                                                    C=args.C, T=T, 
-                                                                    soft_loss_type=args.soft_loss_type)
             if args.use_IB:
-                feats = student_model.layers[:-1](x)
-                _x = x.view(x.shape[0], -1)                
+                shrink_layer_idx = args.IB_layer if shrink_layer_idx is None else shrink_layer_idx
+                feats = student_model.layers[:shrink_layer_idx+1](x)
+                z_ = student_model.layers[shrink_layer_idx+1:](feats)
+                _x = x.view(x.shape[0], -1)
+                feats = feats.view(feats.shape[0], -1)                
                 minet = models.MINet(feats.shape[1], _x.shape[1], 512, 1, args.device)
                 mi_optimizer = torch.optim.Adam(minet.parameters(), lr=args.mi_lr)
                 mi_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(mi_optimizer, 
@@ -169,11 +166,23 @@ def distill(student_model, train_loader, val_loader, base_metric, args, val_metr
                 minet.fit([(feats.detach(),_x.detach())], args.mi_iters, mi_optimizer, mi_scheduler, verbose=False)
                 minet.eval()
                 j,m = minet(feats, _x)
-                mi = minet.compute_nim(j,m).mean()
-                train_loss += 1e-3 * mi
+                mi = minet.compute_nim(j,m).mean()                
                 epoch_mi += float(mi)
-                
+            else:
+                z_ = student_model(x)
+                mi = 0
+            y, z = y.to(args.device), z.to(args.device)
+            train_loss, train_soft_loss, train_hard_loss = criterion(z_, z, y, 
+                                                                    loss_weight=loss_w, 
+                                                                    C=args.C, T=T, 
+                                                                    soft_loss_type=args.soft_loss_type)
+            train_loss += args.IB_weight * max(-1, mi)
             train_loss.backward()
+            # grad_norm = []
+            # for p in student_model.parameters():
+            #     if p.grad is not None:
+            #         grad_norm.append(float(torch.norm(p.grad)))
+            # print('avg grad norm:', np.mean(grad_norm))
             nn.utils.clip_grad_norm_(student_model.parameters(), 5.0)
             optimizer.step()
             epoch_loss += float(train_loss)
@@ -314,7 +323,7 @@ def iterative_distillation(student_model:StudentModelWrapper, bottleneck_layer_i
         if delta < args.tol:
             tuned = True            
             gpu_mem = torch.cuda.memory_allocated(args.device)
-            metric = distill(student_model, train_loader, val_loader, base_metric, args, val_metric_fn, mLogger)
+            metric = distill(student_model, train_loader, val_loader, base_metric, args, val_metric_fn, mLogger, shrink_layer_idx=bottleneck_layer_idx if args.IB_layer is None else args.IB_layer)
             torch.cuda.ipc_collect()
             
             print('\nchange in mem after distillation:%d\t%d\n' % (torch.cuda.memory_allocated(args.device) - gpu_mem, torch.cuda.memory_allocated()))
@@ -440,7 +449,9 @@ def global_compression(student_model:StudentModelWrapper, train_dataset,
         pruned_neurons = sorted_neurons[:int((1-args.shrink_factor)*len(sorted_neurons))]
         layer2neuron = {}
         for li,ni,_ in pruned_neurons:
-            layer2neuron.setdefault(li,[]).append(ni)
+            layer_size,_ = utils.get_layer_input_output_size(student_model.layers[li])
+            if len(layer2neuron.get(li, [])) < layer_size - 1:
+                layer2neuron.setdefault(li,[]).append(ni)
         print(layer2neuron)
         for li in sorted(layer2neuron.keys(), reverse=True):
             student_model.shrink_layer(li, batch_loader, 
@@ -669,11 +680,15 @@ if __name__ == '__main__':
     parser.add_argument('--scale_by_grad', type=str, default='none', choices=('none', 'output', 'loss'))
     parser.add_argument('--global_pruning', action='store_true')
     parser.add_argument('--random_seed', type=int, default=1494)
-    parser.add_argument('--scale_by_mi', action='store_true')
+    parser.add_argument('--scale_by_mi', type=str, default='none', choices=('features', 'residual'))
+    parser.add_argument('--score_by_mi', type=str, default='none', choices=('features', 'residual'))
+    parser.add_argument('--mizx_weight', type=float, default=1e-3)
     parser.add_argument('--mi_lr', type=float, default=1e-3)
     parser.add_argument('--mi_batch_size', type=int, default=256)
     parser.add_argument('--mi_iters', type=int, default=1000)
     parser.add_argument('--use_IB', action='store_true')
+    parser.add_argument('--IB_weight', type=float, default=1e-3)
+    parser.add_argument('--IB_layer', type=int)
     args = parser.parse_args()
 
     np.random.seed(args.random_seed)
