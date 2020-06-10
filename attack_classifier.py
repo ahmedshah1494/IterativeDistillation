@@ -23,10 +23,12 @@ from advertorch.utils import get_accuracy
 from advertorch.loss import CWLoss
 
 class NullAdversary:
-    def __init__(self,*args,**kwargs):
-        pass 
+    def __init__(self,model,**kwargs):
+        self.model = model
     def perturb(self,x,y):
         return x
+    def predict(self, x):
+        return self.model(x)
 
 class NormalizationWrapper(nn.Module):
     def __init__(self, model):
@@ -36,6 +38,48 @@ class NormalizationWrapper(nn.Module):
     def forward(self, x):
         x = utils.normalize_image_tensor(x)
         return self.model(x)
+
+class EnsembleWrapper(nn.Module):
+    def __init__(self, models, concensus_pc=1.):
+        super(EnsembleWrapper, self).__init__()
+        self.models = models
+        self.concensus_pc = concensus_pc
+    
+    def forward(self, x):
+        preds = [nn.functional.gumbel_softmax(m(x), hard=True) for m in self.models]
+        preds = torch.stack(preds, dim=0).sum(0)
+        preds = torch.cat((preds, torch.zeros((preds.shape[0], 1), device=preds.device)), dim=1)
+
+        for i,p in enumerate(preds):
+            if int(p.max()) < len(self.models) * self.concensus_pc:
+                preds[i] *= 0
+                preds[i, -1] = 1
+        return preds
+
+class GaussianSmoothingWrapper(nn.Module):
+    def __init__(self, model, sigma, concensus_pc=0.5):
+        super(GaussianSmoothingWrapper, self).__init__()
+        self.model = model
+        self.sigma = sigma
+        self.concensus_pc = concensus_pc
+    def _forward(self, x):
+        eps = torch.normal(mean=0, std=self.sigma,size=x.shape).to(x.device)
+        x += eps
+        return self.model(x)
+
+    def forward(self, x, n_samples=1):
+        eps = torch.normal(mean=0, std=self.sigma,size=(n_samples, *(x.shape))).to(x.device)
+        x = x.unsqueeze(0) + eps
+        x = x.view(n_samples*x.shape[1], *(x.shape[2:]))        
+        preds = nn.functional.gumbel_softmax(self._forward(x), hard=True, dim=1)        
+        preds = preds.view(n_samples, -1, *(preds.shape[1:])).sum(0)        
+        preds = torch.cat((preds, torch.zeros((preds.shape[0], 1), device=preds.device)), dim=1)
+
+        for i,p in enumerate(preds):
+            if int(p.max()) < n_samples * self.concensus_pc:
+                preds[i] *= 0
+                preds[i, -1] = 1
+        return preds
 
 class Attacker:
     def __init__(self,source_model, dataloader, attack_class, *args, binary_classification=False, max_instances=-1, **kwargs):
@@ -123,15 +167,13 @@ def extract_attack(args):
 
     return attack_class,attack_kwargs
 
-def whitebox_attack(args):
-    print("Using a white box attack")    
-    model = NormalizationWrapper(torch.load(args.model_path))
-    model.eval()
+def whitebox_attack(model, args):
+    print("Using a white box attack")       
     test_loader = get_test_loader(args.dataset, batch_size=args.batch_size)   
     print("Model configuration")
     
     attack_class,attack_kwargs = extract_attack(args)
-    
+    prefix = "%s-%f" % (args.attack, args.eps)
     # attacker = Attacker(model,test_loader, attack_class=attack_class, max_instances=args.max_instances, 
     #                     clip_min=0., clip_max=1., targeted=False, binary_classification=args.binary_classification, 
     #                     **attack_kwargs)
@@ -146,36 +188,59 @@ def whitebox_attack(args):
     else:
         attacker = attackers[0]
     adv, label, pred, advpred = attack_whole_dataset(attacker, test_loader)
-    print('clean accuracy:',get_accuracy(pred, label))
-    print('robust accuracy:',get_accuracy(advpred, label))    
+    print(prefix, 'clean accuracy:',get_accuracy(pred, label))
+    print(prefix, 'robust accuracy:',get_accuracy(advpred, label))
+    detection_TPR = (advpred == label.max() + 1).float().mean()
+    detection_FPR = (pred == label.max() + 1).float().mean()
+    print(prefix, 'attack success rate:', 1 - ((advpred == label) | (advpred == label.max() + 1)).float().mean())
+    print(prefix, 'attack detection TPR:', detection_TPR)
+    print(prefix, 'attack detection FPR:', detection_FPR)
 
-    outfile = os.path.join(os.path.dirname(args.model_path), 'advdata_%s_eps=%f.npy' % (args.attack, args.eps))
+    outfile = args.model_path + 'advdata_%s_eps=%f_%drestarts.pt' % (args.attack, args.eps, args.nb_restarts)
     torch.save({
+        'args': dict(vars(args)),
         'data': adv,
         'preds': advpred,
+        'clean_preds': pred,
         'labels': label
     }, outfile)
 
 
-def transfer_attack(args):    
-    model = NormalizationWrapper(torch.load(args.model_path))
-    target_model = NormalizationWrapper(torch.load(args.target_model_path))
-    model.eval()
-    target_model.eval()
-    if args.datafolder:
-        model.args.datafolder = args.datafolder
-    print("Source model configuration")
-    print(model)
-    print("Target model configuration")
-    print(target_model)
-    test_loader = get_test_loader(args.dataset, batch_size=128)
-    
-    attack_class,attack_kwargs = extract_attack(args)
+def transfer_attack(model, args):    
+    # args.dataset must be path to a that file loadable by torch.load and that contains a dictionary:
+    # {    
+    #   data: (adversarially perturbed) data samples,
+    #   preds: the predictions of the source model on the data
+    #   labels: the true labels of the data
+    # }
+    print('Running transfer attack...')
+    print('source:', args.dataset)
+    print('target:', args.model_path)
 
-    attacker = Attacker(model,test_loader, attack_class=attack_class, max_instances=args.max_instances, clip_min=0., clip_max=1., targeted=False, **attack_kwargs)
+    source_data = torch.load(args.dataset)
+    loader = DataLoader(source_data['data'], batch_size=args.batch_size, shuffle=False)
 
-    accuracy = attacker.eval(attacked_model = target_model)
-    print("Accuracy under attack : %f"%accuracy)
+    preds = []
+    for x_adv in loader:
+        x_adv = x_adv.cuda()        
+        logits = model(x_adv)
+        preds.append(logits.argmax(1))
+    preds = torch.cat(preds)
+
+    print('accuracy:',get_accuracy(preds, source_data['labels']))
+    print('agreement:',get_accuracy(preds, source_data['preds']))
+
+    outfile = "logs/transfer_attack_outputs/%s/%s.pt" % (os.path.basename(args.model_path).split('.')[0], os.path.basename(args.dataset))
+    if not os.path.exists(os.path.dirname(outfile)):
+        os.makedirs(os.path.dirname(outfile))
+
+    torch.save({
+        'sourc_attack_args': source_data['args'],
+        'source_adv_data': source_data['data'],
+        'source_preds': source_data['preds'],
+        'target_preds': preds,
+        'labels': source_data['labels']
+    }, outfile)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()    
@@ -195,11 +260,22 @@ if __name__ == '__main__':
     parser.add_argument('--gamma', type=float, default=1.0)
     parser.add_argument('--max_iters', type=float, default=100)
     parser.add_argument('--binary_classification', action='store_true')
+    parser.add_argument('--transfer_attack', action='store_true')
+    parser.add_argument('--use_gs_wrapper', action='store_true')
+    parser.add_argument('--gs_sigma', type=float, default=0.12)
+    parser.add_argument('--no_normalize', action='store_true')
 
     args = parser.parse_args()
-    args.dataset = args.dataset.upper()
+    
+    model = torch.load(args.model_path)    
+    if not args.no_normalize:
+        model = NormalizationWrapper(model)
+    if args.use_gs_wrapper:
+        model = GaussianSmoothingWrapper(model, args.gs_sigma)
+    model.eval()
 
-    if args.target_model_path:
-        transfer_attack(args)
+    if args.transfer_attack:
+        transfer_attack(model, args)
     else:
-        whitebox_attack(args)
+        args.dataset = args.dataset.upper()
+        whitebox_attack(model, args)
