@@ -101,11 +101,7 @@ def get_common_transform(training=True):
             ]
     else:
         transform_list = []
-    transform_list += [torchvision.transforms.ToTensor(),
-                        torchvision.transforms.Normalize(
-                            mean=[0.485, 0.456, 0.406],
-                            std=[0.229, 0.224, 0.225]
-                        )]
+    transform_list += [torchvision.transforms.ToTensor()]
     transform = torchvision.transforms.Compose(transform_list)
     return transform
 
@@ -204,6 +200,15 @@ def change_layer_input(layer, new_size):
 
     return new_layer
 
+def get_min_consecutive_difference(array):
+    if len(array) < 2:
+        return 0
+    array = sorted(array)
+    min_diff = max(array)+1
+    for i in range(len(array)-1):
+        min_diff = min(min_diff, array[i+1] - array[i])
+    return min_diff
+
 def Softmax(data, axis, T):
     return softmax(data/T, axis=axis)
     
@@ -217,18 +222,44 @@ def get_layer_input_output_size(layer):
     else:
         raise NotImplementedError('%s not supported' % str(type(layer)))
 
-def get_datasets(args):
+def denormalize_image_tensor(x, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]):
+    mean = torch.FloatTensor(mean).to(x.device).view(1,3,1,1)
+    std = torch.FloatTensor(std).to(x.device).view(1,3,1,1)
+
+    return (x * std) + mean
+
+def normalize_image_tensor(x, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]):
+    mean = torch.FloatTensor(mean).to(x.device).view(1,3,1,1)
+    std = torch.FloatTensor(std).to(x.device).view(1,3,1,1)
+
+    return (x-mean)/std
+
+def get_datasets(args, normalize=True):
     common_transform = get_common_transform()
     test_transform = get_common_transform(training=False)
-    if args.dataset == 'cifar10':        
+
+    if args.dataset == 'cifar10':
+        train_transform = common_transform
+        if normalize:
+            train_transform = transforms.Compose([
+                train_transform,
+                transforms.Normalize([0.485, 0.456, 0.406],
+                                [0.229, 0.224, 0.225])  # Imagenet standards
+            ])
+            test_transform = transforms.Compose([
+                test_transform,
+                transforms.Normalize([0.485, 0.456, 0.406],
+                                [0.229, 0.224, 0.225])  # Imagenet standards
+            ])
+        
         train_dataset = torchvision.datasets.CIFAR10('%s/'%args.datafolder, 
-                    transform=common_transform, download=True)
+                    transform=train_transform, download=True)
         test_dataset = torchvision.datasets.CIFAR10('%s/'%args.datafolder, train=False,
                     transform=test_transform, download=True)        
         nclasses = 10
     elif args.dataset == 'cifar100':
         train_dataset = torchvision.datasets.CIFAR100('%s/'%args.datafolder, 
-                    transform=common_transform, download=True)
+                    transform=train_transform, download=True)
         test_dataset = torchvision.datasets.CIFAR100('%s/'%args.datafolder, train=False,
                     transform=test_transform, download=True)        
         nclasses = 100
@@ -239,18 +270,27 @@ def get_datasets(args):
             transforms.ColorJitter(),
             transforms.RandomHorizontalFlip(),
             transforms.CenterCrop(size=224),  # Image net standards
-            transforms.ToTensor(),
-            transforms.Normalize([0.485, 0.456, 0.406],
-                                [0.229, 0.224, 0.225])  # Imagenet standards
+            transforms.ToTensor(),            
         ])
 
         test_transform = transforms.Compose([
             transforms.Resize(size=256),
             transforms.CenterCrop(size=224),
             transforms.ToTensor(),
-            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+            # transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
         ])
 
+        if normalize:
+            train_transform = transforms.Compose([
+                train_transform,
+                transforms.Normalize([0.485, 0.456, 0.406],
+                                [0.229, 0.224, 0.225])  # Imagenet standards
+            ])
+            test_transform = transforms.Compose([
+                test_transform,
+                transforms.Normalize([0.485, 0.456, 0.406],
+                                [0.229, 0.224, 0.225])  # Imagenet standards
+            ])        
         if args.dataset == 'caltech101':
             ntrain_files = 30
             nclasses = 102
@@ -296,6 +336,14 @@ def get_datasets(args):
                                                             transform=test_transform)
         print(train_dataset[0][0].shape)
         nclasses = 200
+    elif args.dataset == 'mnist':
+        train_dataset = torchvision.datasets.MNIST('%s/'%args.datafolder, transform=transforms.ToTensor(), download=True)
+        test_dataset = torchvision.datasets.MNIST('%s/'%args.datafolder, transform=transforms.ToTensor(), download=True, train=False)
+        nclasses = 10
+    elif args.dataset == 'f-mnist':
+        train_dataset = torchvision.datasets.FashionMNIST('%s/'%args.datafolder, transform=transforms.ToTensor(), download=True)
+        test_dataset = torchvision.datasets.FashionMNIST('%s/'%args.datafolder, transform=transforms.ToTensor(), download=True, train=False)
+        nclasses = 10
     else:
         raise NotImplementedError
     return train_dataset, test_dataset, nclasses
